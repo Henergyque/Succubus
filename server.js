@@ -23,6 +23,7 @@ if (!ADMIN_TOKEN) console.warn('[boot] ADMIN_TOKEN env not set; admin endpoints 
 try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+try { db.exec(`ALTER TABLE announcements ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS sessions (
@@ -105,7 +106,8 @@ const endSession = db.prepare(`
 const getMeta = db.prepare(`SELECT v FROM meta WHERE k=?`);
 const setMeta = db.prepare(`INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`);
 
-const getAnnouncement = db.prepare(`SELECT id, title, body, url, type, version, expiresAt, created_at FROM announcements WHERE active = 1 ORDER BY created_at DESC LIMIT 1`);
+const getAnnouncement = db.prepare(`SELECT id, title, body, url, type, version, expiresAt, created_at, view_count FROM announcements WHERE active = 1 ORDER BY created_at DESC LIMIT 1`);
+const incrementViewCount = db.prepare(`UPDATE announcements SET view_count = view_count + 1 WHERE id = ?`);
 const insertAnnouncement = db.prepare(`INSERT INTO announcements (title, body, url, type, version, expiresAt, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`);
 const deactivateAnnouncements = db.prepare(`UPDATE announcements SET active = 0 WHERE active = 1`);
 
@@ -121,7 +123,8 @@ function currentAnnouncement() {
     type: row.type,
     version: row.version,
     expiresAt: row.expiresAt,
-    createdAt: row.created_at
+    createdAt: row.created_at,
+    viewCount: row.view_count || 0
   };
 }
 
@@ -285,7 +288,9 @@ app.get('/v1/announcement', (req, res) => {
   const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
   const isGame = GAME_TOKEN && gameToken === GAME_TOKEN;
   if (!isAdmin && !isGame) return res.status(401).json({ error: 'unauthorized' });
-  res.json({ announcement: currentAnnouncement() });
+  const ann = currentAnnouncement();
+  if (isGame && ann) incrementViewCount.run(ann.id);
+  res.json({ announcement: ann });
 });
 
 app.post('/v1/announcement', requireAdmin, (req, res) => {
