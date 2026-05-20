@@ -288,9 +288,16 @@ app.get('/v1/announcement', (req, res) => {
   const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
   const isGame = GAME_TOKEN && gameToken === GAME_TOKEN;
   if (!isAdmin && !isGame) return res.status(401).json({ error: 'unauthorized' });
-  const ann = currentAnnouncement();
-  if (isGame && ann) incrementViewCount.run(ann.id);
-  res.json({ announcement: ann });
+  res.json({ announcement: currentAnnouncement() });
+});
+
+app.post('/v1/announcement/:id/view', (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
+  incrementViewCount.run(id);
+  res.json({ ok: true });
 });
 
 app.post('/v1/announcement', requireAdmin, (req, res) => {
