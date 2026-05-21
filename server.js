@@ -15,6 +15,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DB_DIR = process.env.DB_DIR || '/data';
 const DB_PATH = path.join(DB_DIR, 'telemetry.db');
 const ACTIVE_WINDOW_MS = 2 * 60 * 1000; // session counted "online" if event within 2 min
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
 if (!GAME_TOKEN) console.warn('[boot] GAME_TOKEN env not set; /v1/event will reject everything.');
 if (!ADMIN_TOKEN) console.warn('[boot] ADMIN_TOKEN env not set; admin endpoints will reject everything.');
@@ -306,6 +307,23 @@ app.post('/v1/announcement', requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'title and body are required' });
   }
   publishAnnouncement(body);
+  if (DISCORD_WEBHOOK_URL) {
+    const embed = {
+      embeds: [{
+        title: body.title,
+        description: body.body,
+        color: 0x9B2CB8,
+        footer: { text: 'Succubus Games — Kutushmurf' },
+        timestamp: new Date().toISOString(),
+        ...(body.url ? { url: body.url } : {}),
+      }]
+    };
+    fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(embed),
+    }).catch(err => console.error('[webhook] Discord post failed:', err.message));
+  }
   res.json({ ok: true, announcement: currentAnnouncement() });
 });
 
