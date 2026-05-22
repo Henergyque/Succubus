@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
   v TEXT
 );
+CREATE TABLE IF NOT EXISTS bug_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  player_id TEXT,
+  error TEXT,
+  stack TEXT,
+  zone TEXT,
+  version TEXT,
+  platform TEXT,
+  ts INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS discord_links (
   player_id TEXT PRIMARY KEY,
   discord_username TEXT NOT NULL,
@@ -339,6 +350,22 @@ app.delete('/v1/announcement', requireAdmin, (req, res) => {
 });
 
 app.get('/v1/stats/live', requireAdmin, (req, res) => res.json(liveStats()));
+
+app.post('/v1/report', (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const b = req.body || {};
+  db.prepare(`INSERT INTO bug_reports (player_id, error, stack, zone, version, platform, ts) VALUES (?,?,?,?,?,?,?)`).run(
+    String(b.playerId || '').slice(0, 64) || null,
+    String(b.error   || '').slice(0, 512),
+    String(b.stack   || '').slice(0, 4096),
+    String(b.zone    || '').slice(0, 32),
+    String(b.version || '').slice(0, 32),
+    String(b.platform|| '').slice(0, 32),
+    Date.now()
+  );
+  res.json({ ok: true });
+});
 
 app.post('/v1/players/link', requireAdmin, (req, res) => {
   const { uuid, discordUsername } = req.body || {};
