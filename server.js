@@ -393,6 +393,17 @@ app.get('/v1/players/zones', requireAdmin, (req, res) => {
   for (const row of rows) result[row.player_id] = row.last_zone || 'unknown';
   res.json(result);
 });
+app.get('/v1/reports', requireAdmin, (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
+  const rows = db.prepare(`SELECT id, player_id, error, stack, zone, version, platform, ts FROM bug_reports ORDER BY ts DESC LIMIT ?`).all(limit);
+  res.json({ reports: rows });
+});
+
+app.delete('/v1/reports', requireAdmin, (req, res) => {
+  db.prepare(`DELETE FROM bug_reports`).run();
+  res.json({ ok: true });
+});
+
 app.get('/v1/stats/dropoff', requireAdmin, (req, res) => {
   const range = parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10);
   res.json(dropoffStats(range));
