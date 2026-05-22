@@ -65,6 +65,12 @@ CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
   v TEXT
 );
+CREATE TABLE IF NOT EXISTS discord_links (
+  player_id TEXT PRIMARY KEY,
+  discord_username TEXT NOT NULL,
+  linked_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS announcements (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
@@ -333,6 +339,22 @@ app.delete('/v1/announcement', requireAdmin, (req, res) => {
 });
 
 app.get('/v1/stats/live', requireAdmin, (req, res) => res.json(liveStats()));
+
+app.post('/v1/players/link', requireAdmin, (req, res) => {
+  const { uuid, discordUsername } = req.body || {};
+  if (!uuid || !discordUsername) return res.status(400).json({ error: 'uuid and discordUsername required' });
+  db.prepare(`INSERT OR REPLACE INTO discord_links (player_id, discord_username, linked_at) VALUES (?, ?, ?)`).run(String(uuid).slice(0, 64), String(discordUsername).slice(0, 64), Date.now());
+  res.json({ ok: true });
+});
+
+app.get('/v1/players/discord', (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const uuid = String(req.query.uuid || '').slice(0, 64);
+  if (!uuid) return res.status(400).json({ error: 'uuid required' });
+  const row = db.prepare(`SELECT discord_username FROM discord_links WHERE player_id = ?`).get(uuid);
+  res.json({ username: row ? row.discord_username : null });
+});
 
 app.get('/v1/players/zones', requireAdmin, (req, res) => {
   const rows = db.prepare(`
