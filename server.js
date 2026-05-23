@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS announcements (
 );
 `);
 
+try { db.exec(`ALTER TABLE discord_links ADD COLUMN discord_id TEXT`); } catch(e) {}
+
 const insertEvent = db.prepare(`
   INSERT INTO events (session_id, player_id, ts, type, map_id, zone, payload)
   VALUES (?, ?, ?, ?, ?, ?, ?)
