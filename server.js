@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS bug_reports (
   ts INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS player_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_uuid TEXT NOT NULL,
+  to_uuid TEXT NOT NULL,
+  body TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  read_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS discord_links (
   player_id TEXT PRIMARY KEY,
   discord_username TEXT NOT NULL,
@@ -392,6 +401,35 @@ app.get('/v1/players/discord', (req, res) => {
   if (!uuid) return res.status(400).json({ error: 'uuid required' });
   const row = db.prepare(`SELECT discord_username FROM discord_links WHERE player_id = ?`).get(uuid);
   res.json({ username: row ? row.discord_username : null });
+});
+
+app.post('/v1/messages', (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const { from, to, body } = req.body || {};
+  if (!from || !to || !body) return res.status(400).json({ error: 'from, to and body required' });
+  db.prepare(`INSERT INTO player_messages (from_uuid, to_uuid, body, ts) VALUES (?, ?, ?, ?)`).run(
+    String(from).slice(0, 64), String(to).slice(0, 64), String(body).slice(0, 500), Date.now()
+  );
+  res.json({ ok: true });
+});
+
+app.get('/v1/messages', (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const uuid = String(req.query.uuid || '').slice(0, 64);
+  if (!uuid) return res.status(400).json({ error: 'uuid required' });
+  const rows = db.prepare(`SELECT id, from_uuid, body, ts, read_at FROM player_messages WHERE to_uuid = ? ORDER BY ts DESC LIMIT 50`).all(uuid);
+  res.json({ messages: rows });
+});
+
+app.post('/v1/messages/:id/read', (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
+  db.prepare(`UPDATE player_messages SET read_at = ? WHERE id = ?`).run(Date.now(), id);
+  res.json({ ok: true });
 });
 
 app.get('/v1/players/zones', requireAdmin, (req, res) => {
