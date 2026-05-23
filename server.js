@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS player_messages (
 CREATE TABLE IF NOT EXISTS discord_links (
   player_id TEXT PRIMARY KEY,
   discord_username TEXT NOT NULL,
+  discord_id TEXT,
   linked_at INTEGER NOT NULL
 );
 
@@ -388,10 +389,16 @@ app.post('/v1/report', (req, res) => {
 });
 
 app.post('/v1/players/link', requireAdmin, (req, res) => {
-  const { uuid, discordUsername } = req.body || {};
+  const { uuid, discordUsername, discordId } = req.body || {};
   if (!uuid || !discordUsername) return res.status(400).json({ error: 'uuid and discordUsername required' });
-  db.prepare(`INSERT OR REPLACE INTO discord_links (player_id, discord_username, linked_at) VALUES (?, ?, ?)`).run(String(uuid).slice(0, 64), String(discordUsername).slice(0, 64), Date.now());
+  db.prepare(`INSERT OR REPLACE INTO discord_links (player_id, discord_username, discord_id, linked_at) VALUES (?, ?, ?, ?)`)
+    .run(String(uuid).slice(0, 64), String(discordUsername).slice(0, 64), discordId ? String(discordId).slice(0, 32) : null, Date.now());
   res.json({ ok: true });
+});
+
+app.get('/v1/players/links', requireAdmin, (req, res) => {
+  const rows = db.prepare(`SELECT player_id, discord_id FROM discord_links WHERE discord_id IS NOT NULL`).all();
+  res.json({ links: rows.map(r => ({ uuid: r.player_id, discordId: r.discord_id })) });
 });
 
 app.get('/v1/players/discord', (req, res) => {
