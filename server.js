@@ -371,6 +371,13 @@ app.get('/v1/changelog', gameLimiter, (req, res) => {
 
 app.get('/v1/stats/live', adminLimiter, requireAdmin, (req, res) => res.json(liveStats()));
 
+app.get('/v1/stats/today', adminLimiter, requireAdmin, (req, res) => {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const n = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM sessions WHERE start_ts >= ?`).get(startOfDay.getTime()).n;
+  res.json({ today: n });
+});
+
 app.post('/v1/report', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
