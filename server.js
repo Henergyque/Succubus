@@ -169,6 +169,8 @@ app.set('trust proxy', 1);
 app.use(express.json({ limit: '256kb' }));
 
 const eventLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
+const gameLimiter  = rateLimit({ windowMs: 60 * 1000, max: 30 });
+const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -296,7 +298,7 @@ const LATEST_DASHBOARD_VERSION = process.env.DASHBOARD_LATEST_VERSION || '1.0.0'
 const DASHBOARD_RELEASE_URL = process.env.DASHBOARD_RELEASE_URL || '';
 const DASHBOARD_RELEASE_NOTES = process.env.DASHBOARD_RELEASE_NOTES || '';
 
-app.get('/v1/version', requireAdmin, (req, res) => {
+app.get('/v1/version', adminLimiter, requireAdmin, (req, res) => {
   res.json({
     latest: LATEST_DASHBOARD_VERSION,
     url: DASHBOARD_RELEASE_URL,
@@ -304,7 +306,7 @@ app.get('/v1/version', requireAdmin, (req, res) => {
   });
 });
 
-app.get('/v1/announcement', (req, res) => {
+app.get('/v1/announcement', gameLimiter, (req, res) => {
   const authHeader = req.get('Authorization') || '';
   const gameToken = req.get('X-Game-Token') || '';
   const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
@@ -313,7 +315,7 @@ app.get('/v1/announcement', (req, res) => {
   res.json({ announcement: currentAnnouncement() });
 });
 
-app.post('/v1/announcement/:id/view', (req, res) => {
+app.post('/v1/announcement/:id/view', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   const id = parseInt(req.params.id, 10);
@@ -322,7 +324,7 @@ app.post('/v1/announcement/:id/view', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/v1/announcement', requireAdmin, (req, res) => {
+app.post('/v1/announcement', adminLimiter, requireAdmin, (req, res) => {
   const body = req.body || {};
   if (!body.title || !body.body) {
     return res.status(400).json({ error: 'title and body are required' });
@@ -348,12 +350,12 @@ app.post('/v1/announcement', requireAdmin, (req, res) => {
   res.json({ ok: true, announcement: currentAnnouncement() });
 });
 
-app.delete('/v1/announcement', requireAdmin, (req, res) => {
+app.delete('/v1/announcement', adminLimiter, requireAdmin, (req, res) => {
   deactivateAnnouncements.run();
   res.json({ ok: true });
 });
 
-app.get('/v1/changelog', (req, res) => {
+app.get('/v1/changelog', gameLimiter, (req, res) => {
   const authHeader = req.get('Authorization') || '';
   const gameToken = req.get('X-Game-Token') || '';
   const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
@@ -363,9 +365,9 @@ app.get('/v1/changelog', (req, res) => {
   res.json({ changelog: rows.map(r => ({ id: r.id, title: r.title, body: r.body, url: r.url, version: r.version, createdAt: r.created_at })) });
 });
 
-app.get('/v1/stats/live', requireAdmin, (req, res) => res.json(liveStats()));
+app.get('/v1/stats/live', adminLimiter, requireAdmin, (req, res) => res.json(liveStats()));
 
-app.post('/v1/report', (req, res) => {
+app.post('/v1/report', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   const b = req.body || {};
@@ -381,7 +383,7 @@ app.post('/v1/report', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/v1/players/link', requireAdmin, (req, res) => {
+app.post('/v1/players/link', adminLimiter, requireAdmin, (req, res) => {
   const { uuid, discordUsername, discordId } = req.body || {};
   if (!uuid || !discordUsername) return res.status(400).json({ error: 'uuid and discordUsername required' });
   db.prepare(`INSERT OR REPLACE INTO discord_links (player_id, discord_username, discord_id, linked_at) VALUES (?, ?, ?, ?)`)
@@ -389,12 +391,12 @@ app.post('/v1/players/link', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/v1/players/links', requireAdmin, (req, res) => {
+app.get('/v1/players/links', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`SELECT player_id, discord_id FROM discord_links WHERE discord_id IS NOT NULL`).all();
   res.json({ links: rows.map(r => ({ uuid: r.player_id, discordId: r.discord_id })) });
 });
 
-app.get('/v1/players/discord', (req, res) => {
+app.get('/v1/players/discord', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   const uuid = String(req.query.uuid || '').slice(0, 64);
@@ -403,7 +405,7 @@ app.get('/v1/players/discord', (req, res) => {
   res.json({ username: row ? row.discord_username : null });
 });
 
-app.get('/v1/players/zones', requireAdmin, (req, res) => {
+app.get('/v1/players/zones', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`
     SELECT player_id, last_zone FROM sessions s
     WHERE last_seen = (SELECT MAX(last_seen) FROM sessions WHERE player_id = s.player_id)
@@ -413,22 +415,22 @@ app.get('/v1/players/zones', requireAdmin, (req, res) => {
   for (const row of rows) result[row.player_id] = row.last_zone || 'unknown';
   res.json(result);
 });
-app.get('/v1/reports', requireAdmin, (req, res) => {
+app.get('/v1/reports', adminLimiter, requireAdmin, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
   const rows = db.prepare(`SELECT id, player_id, error, stack, zone, version, platform, ts FROM bug_reports ORDER BY ts DESC LIMIT ?`).all(limit);
   res.json({ reports: rows });
 });
 
-app.delete('/v1/reports', requireAdmin, (req, res) => {
+app.delete('/v1/reports', adminLimiter, requireAdmin, (req, res) => {
   db.prepare(`DELETE FROM bug_reports`).run();
   res.json({ ok: true });
 });
 
-app.get('/v1/stats/dropoff', requireAdmin, (req, res) => {
+app.get('/v1/stats/dropoff', adminLimiter, requireAdmin, (req, res) => {
   const range = parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10);
   res.json(dropoffStats(range));
 });
-app.get('/v1/stats/concurrent', requireAdmin, (req, res) => {
+app.get('/v1/stats/concurrent', adminLimiter, requireAdmin, (req, res) => {
   const range = parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10);
   const bucket = parseInt(req.query.bucketMs || (5 * 60 * 1000), 10);
   res.json(concurrentHistory(range, bucket));
