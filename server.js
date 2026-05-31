@@ -399,6 +399,7 @@ app.post('/v1/report', gameLimiter, (req, res) => {
     String(b.screenshot || '').slice(0, 200000),
     Date.now()
   );
+  broadcastBugReport();
   res.json({ ok: true });
 });
 
@@ -485,6 +486,11 @@ wss.on('connection', (ws, req) => {
   }
   ws.send(JSON.stringify({ type: 'snapshot', live: liveStats() }));
 });
+
+function broadcastBugReport() {
+  const payload = JSON.stringify({ type: 'bug_report' });
+  wss.clients.forEach((c) => { if (c.readyState === 1) c.send(payload); });
+}
 
 let broadcastTimer = null;
 function scheduleBroadcast() {
