@@ -386,7 +386,7 @@ app.get('/v1/game/update', gameLimiter, (req, res) => {
       const baseUrl = `${req.protocol}://${req.get('host')}`;
       manifest.files = manifest.files.map(f => ({
         path: f.path,
-        url: `${baseUrl}/v1/game/update/files/${encodeURIComponent(f.filename)}`,
+        url: `${baseUrl}/v1/game/update/files/${f.filename.split('/').map(encodeURIComponent).join('/')}`,
         sha256: f.sha256
       }));
       delete manifest.hosted;
@@ -402,13 +402,14 @@ app.get('/v1/game/update/admin', adminLimiter, requireAdmin, (req, res) => {
   catch(e) { res.json({ manifest: null }); }
 });
 
-app.get('/v1/game/update/files/:filename', gameLimiter, (req, res) => {
+app.get('/v1/game/update/files/*', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  const filename = path.basename(req.params.filename);
-  const filePath = path.join(UPDATES_DIR, filename);
+  const relative = (req.params[0] || '').replace(/\.\./g, '');
+  const filePath = path.resolve(path.join(UPDATES_DIR, relative));
+  if (!filePath.startsWith(path.resolve(UPDATES_DIR))) return res.status(403).json({ error: 'forbidden' });
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
-  res.type('application/javascript').sendFile(path.resolve(filePath));
+  res.sendFile(filePath);
 });
 
 app.post('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
@@ -421,12 +422,14 @@ app.post('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
     const manifestFiles = [];
     for (const f of body.files) {
       const name = path.basename(String(f.name || ''));
-      const filePath = String(f.path || 'www/js/plugins/' + name);
-      if (!name) continue;
+      const filePath = String(f.path || 'www/js/plugins/' + name).replace(/\.\./g, '').replace(/\\/g, '/');
+      if (!name || !filePath) continue;
       const buf = Buffer.from(f.content, 'base64');
       const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-      fs.writeFileSync(path.join(UPDATES_DIR, name), buf);
-      manifestFiles.push({ path: filePath, filename: name, sha256 });
+      const dest = path.join(UPDATES_DIR, filePath);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, buf);
+      manifestFiles.push({ path: filePath, filename: filePath, sha256 });
     }
     if (manifestFiles.length === 0) return res.status(400).json({ error: 'no valid files' });
     const manifest = { version, files: manifestFiles, hosted: true };
@@ -444,11 +447,7 @@ app.post('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
 
 app.delete('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
   setMeta.run('game_update_manifest', 'null');
-  // Clean stored files
-  try {
-    const files = fs.readdirSync(UPDATES_DIR);
-    for (const f of files) fs.unlinkSync(path.join(UPDATES_DIR, f));
-  } catch(e) {}
+  try { fs.rmSync(UPDATES_DIR, { recursive: true, force: true }); fs.mkdirSync(UPDATES_DIR, { recursive: true }); } catch(e) {}
   res.json({ ok: true });
 });
 
