@@ -9,11 +9,15 @@ const path = require('path');
 const fs = require('fs');
 
 // ---------- Config (env) ----------
+const crypto = require('crypto');
+
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const GAME_TOKEN = process.env.GAME_TOKEN || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DB_DIR = process.env.DB_DIR || '/data';
 const DB_PATH = path.join(DB_DIR, 'telemetry.db');
+const UPDATES_DIR = path.join(DB_DIR, 'updates');
+try { fs.mkdirSync(UPDATES_DIR, { recursive: true }); } catch(e) {}
 const ACTIVE_WINDOW_MS = 2 * 60 * 1000; // session counted "online" if event within 2 min
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
@@ -174,7 +178,7 @@ function publishAnnouncement({ title, body, url, type, version, expiresAt }) {
 // ---------- App ----------
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '512kb' }));
+app.use(express.json({ limit: '5mb' }));
 
 const eventLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 const gameLimiter  = rateLimit({ windowMs: 60 * 1000, max: 30 });
@@ -375,12 +379,63 @@ app.get('/v1/game/update', gameLimiter, (req, res) => {
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   const row = getMeta.get('game_update_manifest');
   if (!row) return res.json({ manifest: null });
+  try {
+    const manifest = JSON.parse(row.v);
+    if (!manifest) return res.json({ manifest: null });
+    if (manifest.hosted && Array.isArray(manifest.files)) {
+      const baseUrl = `${req.protocol}://${req.get('host')}`;
+      manifest.files = manifest.files.map(f => ({
+        path: f.path,
+        url: `${baseUrl}/v1/game/update/files/${encodeURIComponent(f.filename)}`,
+        sha256: f.sha256
+      }));
+      delete manifest.hosted;
+    }
+    res.json({ manifest });
+  } catch(e) { res.json({ manifest: null }); }
+});
+
+app.get('/v1/game/update/admin', adminLimiter, requireAdmin, (req, res) => {
+  const row = getMeta.get('game_update_manifest');
+  if (!row) return res.json({ manifest: null });
   try { res.json({ manifest: JSON.parse(row.v) }); }
   catch(e) { res.json({ manifest: null }); }
 });
 
+app.get('/v1/game/update/files/:filename', gameLimiter, (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const filename = path.basename(req.params.filename);
+  const filePath = path.join(UPDATES_DIR, filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
+  res.type('application/javascript').sendFile(path.resolve(filePath));
+});
+
 app.post('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
-  const { manifest } = req.body || {};
+  const body = req.body || {};
+
+  // New format from dashboard: { version, files: [{ name, path, content (base64) }] }
+  if (body.version && Array.isArray(body.files) && body.files.length > 0 && body.files[0].content) {
+    const version = String(body.version).trim();
+    if (!version) return res.status(400).json({ error: 'version is required' });
+    const manifestFiles = [];
+    for (const f of body.files) {
+      const name = path.basename(String(f.name || ''));
+      const filePath = String(f.path || 'www/js/plugins/' + name);
+      if (!name) continue;
+      const buf = Buffer.from(f.content, 'base64');
+      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+      fs.writeFileSync(path.join(UPDATES_DIR, name), buf);
+      manifestFiles.push({ path: filePath, filename: name, sha256 });
+    }
+    if (manifestFiles.length === 0) return res.status(400).json({ error: 'no valid files' });
+    const manifest = { version, files: manifestFiles, hosted: true };
+    setMeta.run('game_update_manifest', JSON.stringify(manifest));
+    return res.json({ ok: true, manifest });
+  }
+
+  // Old format from set-update.js: { manifest: { version, files: [{ path, url, sha256 }] } }
+  const { manifest } = body;
   if (!manifest || !manifest.version || !Array.isArray(manifest.files))
     return res.status(400).json({ error: 'invalid manifest' });
   setMeta.run('game_update_manifest', JSON.stringify(manifest));
@@ -389,6 +444,11 @@ app.post('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
 
 app.delete('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
   setMeta.run('game_update_manifest', 'null');
+  // Clean stored files
+  try {
+    const files = fs.readdirSync(UPDATES_DIR);
+    for (const f of files) fs.unlinkSync(path.join(UPDATES_DIR, f));
+  } catch(e) {}
   res.json({ ok: true });
 });
 
