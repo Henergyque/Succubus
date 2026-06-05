@@ -373,6 +373,11 @@ app.delete('/v1/announcement', adminLimiter, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+app.delete('/v1/changelog', adminLimiter, requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM announcements').run();
+  res.json({ ok: true });
+});
+
 // ---------- Game auto-update ----------
 app.get('/v1/game/update', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
