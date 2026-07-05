@@ -178,6 +178,16 @@ function publishAnnouncement({ title, body, url, type, version, expiresAt }) {
 // ---------- App ----------
 const app = express();
 app.set('trust proxy', 1);
+
+// CORS — allow all origins so Android/Cordova (null origin from file://) can reach the server
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Game-Token, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: '5mb' }));
 
 const eventLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
