@@ -183,7 +183,7 @@ app.set('trust proxy', 1);
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Game-Token, Authorization');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -555,6 +555,65 @@ app.get('/v1/stats/concurrent', adminLimiter, requireAdmin, (req, res) => {
   const range  = Math.max(1, Math.min(parseInt(req.query.rangeMs  || (24 * 3600 * 1000), 10), 90 * 24 * 3600 * 1000));
   const bucket = Math.max(60000, Math.min(parseInt(req.query.bucketMs || (5 * 60 * 1000), 10), 24 * 3600 * 1000));
   res.json(concurrentHistory(range, bucket));
+});
+
+app.get('/v1/stats/platforms', adminLimiter, requireAdmin, (req, res) => {
+  const totalRows = db.prepare(`
+    SELECT platform, COUNT(DISTINCT player_id) AS players
+    FROM sessions WHERE platform IS NOT NULL GROUP BY platform
+  `).all();
+  const total = {};
+  for (const r of totalRows) total[r.platform] = r.players;
+
+  const cutoff = Date.now() - ACTIVE_WINDOW_MS;
+  const onlineRows = db.prepare(`
+    SELECT platform, COUNT(*) AS online
+    FROM sessions WHERE end_ts IS NULL AND last_seen >= ? AND platform IS NOT NULL GROUP BY platform
+  `).all(cutoff);
+  const online = {};
+  for (const r of onlineRows) online[r.platform] = r.online;
+
+  res.json({ total, online });
+});
+
+app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
+  const row = db.prepare(`
+    SELECT COUNT(*) AS total_sessions,
+           AVG(end_ts - start_ts) AS avg_ms,
+           SUM(end_ts - start_ts) AS total_ms
+    FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
+  `).get();
+  res.json({
+    total_sessions: row.total_sessions || 0,
+    avg_ms: Math.round(row.avg_ms || 0),
+    total_ms: Math.round(row.total_ms || 0)
+  });
+});
+
+const DEFAULT_ZONE_LABELS = {
+  intro: 'Intro / Maison', jeu1: 'Trial 1', jeu2_hub: 'Trial 2 — Hub',
+  jeu2_gauche: 'Trial 2 — Left', jeu2_droite: 'Trial 2 — Right', jeu2_arbre: 'Trial 2 — Tree',
+  endgame: 'Endgame', speciales: 'Special rooms', unknown: 'Unknown'
+};
+
+app.get('/v1/admin/zones', adminLimiter, requireAdmin, (req, res) => {
+  const row = getMeta.get('zone_labels');
+  try {
+    const labels = row ? Object.assign({}, DEFAULT_ZONE_LABELS, JSON.parse(row.v)) : DEFAULT_ZONE_LABELS;
+    res.json({ labels });
+  } catch(e) {
+    res.json({ labels: DEFAULT_ZONE_LABELS });
+  }
+});
+
+app.put('/v1/admin/zones', adminLimiter, requireAdmin, (req, res) => {
+  const labels = req.body || {};
+  const cleaned = {};
+  for (const k of Object.keys(DEFAULT_ZONE_LABELS)) {
+    cleaned[k] = labels[k] !== undefined ? String(labels[k]).slice(0, 64) : DEFAULT_ZONE_LABELS[k];
+  }
+  setMeta.run('zone_labels', JSON.stringify(cleaned));
+  res.json({ ok: true, labels: cleaned });
 });
 
 // ---------- Snapshot cron ----------
