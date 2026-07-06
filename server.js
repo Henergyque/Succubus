@@ -576,6 +576,22 @@ app.get('/v1/stats/platforms', adminLimiter, requireAdmin, (req, res) => {
   res.json({ total, online });
 });
 
+app.get('/v1/stats/languages', adminLimiter, requireAdmin, (req, res) => {
+  // Normalize locale to its primary subtag (fr-FR -> fr) then count distinct players.
+  const rows = db.prepare(`
+    SELECT CASE
+             WHEN locale IS NULL OR locale = '' OR locale = 'unknown' THEN 'unknown'
+             ELSE LOWER(SUBSTR(locale, 1, 2))
+           END AS lang,
+           COUNT(DISTINCT player_id) AS players
+    FROM sessions
+    GROUP BY lang
+  `).all();
+  const languages = {};
+  for (const r of rows) languages[r.lang] = r.players;
+  res.json({ languages });
+});
+
 app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
   // Average is based on FINISHED sessions only (a partial session isn't a "short session").
   const finished = db.prepare(`
