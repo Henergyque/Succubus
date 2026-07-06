@@ -577,16 +577,28 @@ app.get('/v1/stats/platforms', adminLimiter, requireAdmin, (req, res) => {
 });
 
 app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
-  const row = db.prepare(`
+  // Average is based on FINISHED sessions only (a partial session isn't a "short session").
+  const finished = db.prepare(`
     SELECT COUNT(*) AS total_sessions,
            AVG(end_ts - start_ts) AS avg_ms,
            SUM(end_ts - start_ts) AS total_ms
     FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
   `).get();
+
+  // Total cumulative time also counts time currently being played by ACTIVE sessions
+  // (last_seen recent), so it climbs live. Crashed/ghost sessions are excluded.
+  const now = Date.now();
+  const cutoff = now - ACTIVE_WINDOW_MS;
+  const active = db.prepare(`
+    SELECT SUM(? - start_ts) AS ongoing_ms
+    FROM sessions WHERE end_ts IS NULL AND last_seen >= ? AND start_ts <= ?
+  `).get(now, cutoff, now);
+
+  const totalMs = (finished.total_ms || 0) + (active.ongoing_ms || 0);
   res.json({
-    total_sessions: row.total_sessions || 0,
-    avg_ms: Math.round(row.avg_ms || 0),
-    total_ms: Math.round(row.total_ms || 0)
+    total_sessions: finished.total_sessions || 0,
+    avg_ms: Math.round(finished.avg_ms || 0),
+    total_ms: Math.round(totalMs)
   });
 });
 
