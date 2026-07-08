@@ -557,6 +557,26 @@ app.get('/v1/stats/concurrent', adminLimiter, requireAdmin, (req, res) => {
   res.json(concurrentHistory(range, bucket));
 });
 
+app.get('/v1/stats/newplayers', adminLimiter, requireAdmin, (req, res) => {
+  // A "new player" on day D = a player whose FIRST session ever started on day D.
+  const days = Math.max(1, Math.min(parseInt(req.query.days || '30', 10), 365));
+  const since = Date.now() - days * 24 * 3600 * 1000;
+  const rows = db.prepare(`
+    WITH firsts AS (
+      SELECT player_id, MIN(start_ts) AS first_ts
+      FROM sessions
+      GROUP BY player_id
+    )
+    SELECT strftime('%Y-%m-%d', first_ts / 1000, 'unixepoch', 'localtime') AS day,
+           COUNT(*) AS count
+    FROM firsts
+    WHERE first_ts >= ?
+    GROUP BY day
+    ORDER BY day ASC
+  `).all(since);
+  res.json({ points: rows });
+});
+
 app.get('/v1/stats/platforms', adminLimiter, requireAdmin, (req, res) => {
   const totalRows = db.prepare(`
     SELECT platform, COUNT(DISTINCT player_id) AS players
