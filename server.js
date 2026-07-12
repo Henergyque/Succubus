@@ -655,6 +655,31 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
   });
 });
 
+// Diagnostic: distribution of finished-session durations across buckets.
+app.get('/v1/stats/sessions/distribution', adminLimiter, requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT CASE
+             WHEN d < 10000    THEN '00 <10s'
+             WHEN d < 60000    THEN '01 10-60s'
+             WHEN d < 300000   THEN '02 1-5m'
+             WHEN d < 900000   THEN '03 5-15m'
+             WHEN d < 1800000  THEN '04 15-30m'
+             WHEN d < 3600000  THEN '05 30-60m'
+             WHEN d < 7200000  THEN '06 1-2h'
+             WHEN d < 21600000 THEN '07 2-6h'
+             WHEN d < 43200000 THEN '08 6-12h'
+             WHEN d < 86400000 THEN '09 12-24h'
+             ELSE                   '10 >24h'
+           END AS bucket,
+           COUNT(*) AS n
+    FROM (SELECT (end_ts - start_ts) AS d FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts)
+    GROUP BY bucket
+    ORDER BY bucket ASC
+  `).all();
+  const total = rows.reduce((a, r) => a + r.n, 0);
+  res.json({ total, buckets: rows.map(r => ({ range: r.bucket.slice(3), n: r.n, pct: total ? Math.round(r.n / total * 1000) / 10 : 0 })) });
+});
+
 const DEFAULT_ZONE_LABELS = {
   intro: 'Intro / Maison', jeu1: 'Trial 1', jeu2_hub: 'Trial 2 — Hub',
   jeu2_gauche: 'Trial 2 — Left', jeu2_droite: 'Trial 2 — Right', jeu2_arbre: 'Trial 2 — Tree',
