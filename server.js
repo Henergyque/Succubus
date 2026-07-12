@@ -617,9 +617,24 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
   const finished = db.prepare(`
     SELECT COUNT(*) AS total_sessions,
            AVG(end_ts - start_ts) AS avg_ms,
-           SUM(end_ts - start_ts) AS total_ms
+           SUM(end_ts - start_ts) AS total_ms,
+           MAX(end_ts - start_ts) AS longest_ms
     FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
   `).get();
+
+  // Median duration of finished sessions (middle value; avg of two middles if even count).
+  let medianMs = 0;
+  const n = finished.total_sessions || 0;
+  if (n > 0) {
+    const off = Math.floor((n - 1) / 2);
+    const lim = (n % 2 === 0) ? 2 : 1;
+    const mids = db.prepare(`
+      SELECT (end_ts - start_ts) AS d
+      FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
+      ORDER BY d ASC LIMIT ? OFFSET ?
+    `).all(lim, off);
+    if (mids.length) medianMs = mids.reduce((a, r) => a + r.d, 0) / mids.length;
+  }
 
   // Total cumulative time also counts time currently being played by ACTIVE sessions
   // (last_seen recent), so it climbs live. Crashed/ghost sessions are excluded.
@@ -634,6 +649,8 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
   res.json({
     total_sessions: finished.total_sessions || 0,
     avg_ms: Math.round(finished.avg_ms || 0),
+    median_ms: Math.round(medianMs),
+    longest_ms: Math.round(finished.longest_ms || 0),
     total_ms: Math.round(totalMs)
   });
 });
