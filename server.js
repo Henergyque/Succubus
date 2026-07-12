@@ -655,6 +655,21 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
   });
 });
 
+// Progression funnel: distinct players who EVER reached each zone (from events).
+app.get('/v1/stats/progression', adminLimiter, requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT zone, COUNT(DISTINCT player_id) AS players
+    FROM events WHERE zone IS NOT NULL AND zone != '' AND zone != 'unknown'
+    GROUP BY zone
+  `).all();
+  const byZone = {};
+  for (const r of rows) byZone[r.zone] = r.players;
+  const eventsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM events`).get().n;
+  const sessionsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM sessions`).get().n;
+  const eventsTotal = db.prepare(`SELECT COUNT(*) AS n FROM events`).get().n;
+  res.json({ byZone, eventsPlayers, sessionsPlayers, eventsTotal });
+});
+
 // Diagnostic: distribution of finished-session durations across buckets.
 app.get('/v1/stats/sessions/distribution', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`
