@@ -655,6 +655,38 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
   });
 });
 
+// Demo completion: players who reached BOTH Trial 2 branches (the 2 crystals),
+// plus per-map depth reached in each branch to locate where crystals are picked up.
+app.get('/v1/stats/completion', adminLimiter, requireAdmin, (req, res) => {
+  const bothBranches = db.prepare(`
+    SELECT COUNT(*) AS n FROM (
+      SELECT player_id FROM events WHERE zone='jeu2_gauche'
+      INTERSECT
+      SELECT player_id FROM events WHERE zone='jeu2_droite'
+    )
+  `).get().n;
+  const gaucheOnly = db.prepare(`
+    SELECT COUNT(*) AS n FROM (
+      SELECT player_id FROM events WHERE zone='jeu2_gauche'
+      EXCEPT
+      SELECT player_id FROM events WHERE zone='jeu2_droite'
+    )
+  `).get().n;
+  const droiteOnly = db.prepare(`
+    SELECT COUNT(*) AS n FROM (
+      SELECT player_id FROM events WHERE zone='jeu2_droite'
+      EXCEPT
+      SELECT player_id FROM events WHERE zone='jeu2_gauche'
+    )
+  `).get().n;
+  const maps = db.prepare(`
+    SELECT map_id, COUNT(DISTINCT player_id) AS players
+    FROM events WHERE map_id IN (19,21,22,28,29,23,24,25,26,27,30,31)
+    GROUP BY map_id ORDER BY map_id
+  `).all();
+  res.json({ bothBranches, gaucheOnly, droiteOnly, maps });
+});
+
 // Progression funnel: distinct players who EVER reached each zone (from events).
 app.get('/v1/stats/progression', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`
