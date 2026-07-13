@@ -194,7 +194,7 @@ const eventLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 const gameLimiter  = rateLimit({ windowMs: 60 * 1000, max: 30 });
 const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => res.json({ ok: true, uptimeSec: Math.round(process.uptime()) }));
 
 // ---------- Ingest ----------
 app.post('/v1/event', eventLimiter, (req, res) => {
