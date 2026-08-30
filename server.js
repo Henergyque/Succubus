@@ -502,6 +502,33 @@ function requireAdmin(req, res, next) {
 }
 
 // ---------- Stats queries ----------
+/* Le record etait un simple compteur en base : decoupe par version, il repart
+   de zero pour chacune et n'affiche plus que le pic observe depuis. Le vrai
+   pic se recalcule depuis les sessions — un balayage des ouvertures et des
+   fermetures, en gardant le maximum de la somme courante. Memoise, parce que
+   liveStats tourne toutes les cinq secondes. */
+let _peakCache = { key: null, value: 0, at: 0 };
+function historicalPeak(version) {
+  const key = version || '';
+  if (_peakCache.key === key && Date.now() - _peakCache.at < 5 * 60 * 1000) return _peakCache.value;
+  let peak = 0;
+  try {
+    const row = db.prepare(`
+      SELECT MAX(running) AS peak FROM (
+        SELECT SUM(d) OVER (ORDER BY t, d DESC ROWS UNBOUNDED PRECEDING) AS running
+        FROM (
+          SELECT start_ts AS t, 1 AS d FROM v_sessions
+          UNION ALL
+          SELECT COALESCE(end_ts, last_seen) AS t, -1 AS d FROM v_sessions
+        )
+      )
+    `).get();
+    peak = (row && row.peak) || 0;
+  } catch (e) {}
+  _peakCache = { key, value: peak, at: Date.now() };
+  return peak;
+}
+
 function liveStats() {
   const cutoff = Date.now() - ACTIVE_WINDOW_MS;
   const rows = db.prepare(`
@@ -531,7 +558,7 @@ function liveStats() {
     totalOnline: rows.length,
     byZone,
     byMap,
-    record: Math.max(record, rows.length),
+    record: Math.max(record, historicalPeak(tv), rows.length),
     totalUniques
   };
 }
@@ -555,17 +582,30 @@ function dropoffStats(rangeMs) {
   return { byZone: toSorted(byZone), byMap: toSorted(byMap) };
 }
 
+/* La courbe se deduit des sessions plutot que des releves minute par minute.
+   Les releves ne portaient pas de version — et les estampiller avec la version
+   affichee aurait fait dependre l'historique de ce que l'operateur regardait au
+   moment du releve. Les sessions, elles, portent leur version depuis toujours :
+   la courbe d'une ancienne version reste donc consultable retroactivement.
+
+   Une session compte dans un intervalle si elle en chevauche une partie. Sa fin
+   est end_ts quand elle s'est fermee proprement, sinon le dernier signe de vie. */
 function concurrentHistory(rangeMs, bucketMs) {
-  const since = Date.now() - rangeMs;
+  const now = Date.now();
+  const since = Math.floor((now - rangeMs) / bucketMs) * bucketMs;
   return db.prepare(`
-    SELECT (ts / ?) * ? AS bucket, MAX(count) AS count
-    FROM concurrent_snapshots
-    WHERE ts >= ?
-      AND ((SELECT v FROM meta WHERE k = 'tracked_version') IS NULL
-           OR version = (SELECT v FROM meta WHERE k = 'tracked_version'))
-    GROUP BY bucket
-    ORDER BY bucket ASC
-  `).all(bucketMs, bucketMs, since);
+    WITH RECURSIVE buckets(b) AS (
+      SELECT ?
+      UNION ALL
+      SELECT b + ? FROM buckets WHERE b + ? <= ?
+    )
+    SELECT b AS bucket,
+           (SELECT COUNT(*) FROM v_sessions s
+             WHERE s.start_ts < b + ?
+               AND COALESCE(s.end_ts, s.last_seen) >= b) AS count
+    FROM buckets
+    ORDER BY b ASC
+  `).all(since, bucketMs, bucketMs, now, bucketMs);
 }
 
 const LATEST_DASHBOARD_VERSION = process.env.DASHBOARD_LATEST_VERSION || '1.0.0';
@@ -1416,11 +1456,11 @@ app.put('/v1/admin/zones', adminLimiter, requireAdmin, (req, res) => {
 // ---------- Snapshot cron ----------
 function takeSnapshot() {
   const cutoff = Date.now() - ACTIVE_WINDOW_MS;
-  /* Le compteur suit la version affichee : la courbe historique de la version
-     en cours demarre donc au premier releve, les anciens points restant
-     globaux (version NULL) et sortant du champ des qu'une version est suivie. */
-  const n = db.prepare(`SELECT COUNT(*) AS n FROM v_sessions WHERE last_seen >= ? AND end_ts IS NULL`).get(cutoff).n;
-  db.prepare(`INSERT OR REPLACE INTO concurrent_snapshots(ts, count, version) VALUES (?, ?, ?)`).run(Date.now(), n, trackedVersion());
+  /* Releve global, toutes versions confondues : la courbe du dashboard ne s'en
+     sert plus (elle se deduit des sessions), et l'estampiller avec la version
+     affichee ferait dependre l'historique de ce que l'operateur regardait. */
+  const n = db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE last_seen >= ? AND end_ts IS NULL`).get(cutoff).n;
+  db.prepare(`INSERT OR REPLACE INTO concurrent_snapshots(ts, count) VALUES (?, ?)`).run(Date.now(), n);
   // retention 60 days
   db.prepare(`DELETE FROM concurrent_snapshots WHERE ts < ?`).run(Date.now() - 60 * 24 * 3600 * 1000);
 }
