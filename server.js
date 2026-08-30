@@ -210,6 +210,55 @@ try { db.exec(`ALTER TABLE deaths ADD COLUMN fatal INTEGER NOT NULL DEFAULT 1`);
    coupable n'a pas pu etre identifie. */
 try { db.exec(`ALTER TABLE deaths ADD COLUMN enemy_event_id INTEGER`); } catch(e) {}
 
+/* ------------------------------------------------------------------
+   Filtrage par version du jeu.
+
+   Le dashboard n'affiche qu'une version a la fois : les milliers de joueurs
+   restes sur une ancienne noient sinon les chiffres de celle qui vient de
+   sortir. La version suivie est une simple cle de meta, et des vues la lisent
+   elles-memes : les requetes de lecture passent par les vues et se filtrent
+   toutes seules, sans qu'aucune route ait a y penser.
+
+   La carte VERSIONS, elle, interroge les tables brutes : c'est justement son
+   role de montrer qui est reste en arriere.
+   ------------------------------------------------------------------ */
+function addColumnIfMissing(table, column, decl) {
+  const cols = db.prepare('PRAGMA table_info(' + table + ')').all();
+  if (cols.some((c) => c.name === column)) return;
+  db.exec('ALTER TABLE ' + table + ' ADD COLUMN ' + column + ' ' + decl);
+  console.log('[migration] ' + table + '.' + column + ' ajoutee');
+}
+
+// Ces deux tables sont nees sans version : elles ne pourront etre filtrees
+// que pour les lignes ecrites a partir de maintenant.
+addColumnIfMissing('gameover_choices', 'version', 'TEXT');
+addColumnIfMissing('concurrent_snapshots', 'version', 'TEXT');
+
+const TRACKED = "(SELECT v FROM meta WHERE k = 'tracked_version')";
+
+/* Recrees a chaque demarrage : si la definition d'une vue change, un simple
+   CREATE IF NOT EXISTS garderait silencieusement l'ancienne. */
+function defineView(name, body) {
+  db.exec('DROP VIEW IF EXISTS ' + name);
+  db.exec('CREATE VIEW ' + name + ' AS ' + body);
+}
+
+// tables portant directement la version
+for (const t of ['sessions', 'deaths', 'endings', 'survey_answers', 'bug_reports', 'gameover_choices']) {
+  defineView('v_' + t,
+    'SELECT x.* FROM ' + t + ' x WHERE ' + TRACKED + ' IS NULL OR x.version = ' + TRACKED);
+}
+
+// les events n'ont pas de version : elle est portee par leur session
+defineView('v_events',
+  'SELECT e.* FROM events e WHERE ' + TRACKED + ' IS NULL OR e.session_id IN ' +
+  '(SELECT id FROM sessions WHERE version = ' + TRACKED + ')');
+
+function trackedVersion() {
+  const row = getMeta.get('tracked_version');
+  return row && row.v ? row.v : null;
+}
+
 const insertEvent = db.prepare(`
   INSERT INTO events (session_id, player_id, ts, type, map_id, zone, payload)
   VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -247,14 +296,14 @@ const insertEnding = db.prepare(`
 `);
 
 const insertGameoverChoice = db.prepare(`
-  INSERT INTO gameover_choices (player_id, ts, choice) VALUES (@player_id, @ts, @choice)
+  INSERT INTO gameover_choices (player_id, ts, choice, version) VALUES (@player_id, @ts, @choice, @version)
 `);
 
 // ---------- Sondages ----------
 const getActiveQuestions = db.prepare(`SELECT id, spec FROM survey_questions WHERE active = 1 ORDER BY sort_order, created_at`);
 const getAllQuestions = db.prepare(`
   SELECT q.id, q.spec, q.active, q.sort_order, q.created_at,
-         (SELECT COUNT(DISTINCT submission) FROM survey_answers a WHERE a.question_id = q.id) AS responses
+         (SELECT COUNT(DISTINCT submission) FROM v_survey_answers a WHERE a.question_id = q.id) AS responses
   FROM survey_questions q ORDER BY q.sort_order, q.created_at
 `);
 const getQuestion = db.prepare(`SELECT id, spec, active FROM survey_questions WHERE id = ?`);
@@ -419,7 +468,10 @@ app.post('/v1/event', eventLimiter, (req, res) => {
         }
       } else if (type === 'gameover_choice') {
         const choice = txt(e.choice, 16);
-        if (choice) insertGameoverChoice.run({ player_id: pid, ts, choice });
+        if (choice) {
+          const gvrow = getSessionVersion.get(sid);
+          insertGameoverChoice.run({ player_id: pid, ts, choice, version: gvrow ? gvrow.version : null });
+        }
       }
 
       dirtyTypes.add(type);
@@ -450,7 +502,7 @@ function liveStats() {
   const cutoff = Date.now() - ACTIVE_WINDOW_MS;
   const rows = db.prepare(`
     SELECT id, last_zone AS zone, last_map_id AS mapId
-    FROM sessions
+    FROM v_sessions
     WHERE last_seen >= ? AND end_ts IS NULL
   `).all(cutoff);
 
@@ -461,11 +513,15 @@ function liveStats() {
     byZone[z] = (byZone[z] || 0) + 1;
     if (r.mapId != null) byMap[r.mapId] = (byMap[r.mapId] || 0) + 1;
   }
-  const recordRow = getMeta.get('record_concurrent');
+  /* Un record par version : celui de la 0.3.2, bati sur des milliers de
+     joueurs, ecraserait sinon celui de la version qui vient de sortir. */
+  const tv = trackedVersion();
+  const recordKey = tv ? 'record_concurrent:' + tv : 'record_concurrent';
+  const recordRow = getMeta.get(recordKey);
   const record = recordRow ? parseInt(recordRow.v, 10) : 0;
-  const totalUniques = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM sessions`).get().n;
+  const totalUniques = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions`).get().n;
 
-  if (rows.length > record) setMeta.run('record_concurrent', String(rows.length));
+  if (rows.length > record) setMeta.run(recordKey, String(rows.length));
 
   return {
     totalOnline: rows.length,
@@ -480,7 +536,7 @@ function dropoffStats(rangeMs) {
   const since = Date.now() - rangeMs;
   const ended = db.prepare(`
     SELECT last_zone AS zone, last_map_id AS mapId, COUNT(*) AS n
-    FROM sessions
+    FROM v_sessions
     WHERE COALESCE(end_ts, last_seen) >= ?
       AND (end_ts IS NOT NULL OR last_seen < ?)
     GROUP BY last_zone, last_map_id
@@ -500,6 +556,8 @@ function concurrentHistory(rangeMs, bucketMs) {
   return db.prepare(`
     SELECT (ts / ?) * ? AS bucket, MAX(count) AS count
     FROM concurrent_snapshots
+    WHERE (SELECT v FROM meta WHERE k = 'tracked_version') IS NULL
+       OR version = (SELECT v FROM meta WHERE k = 'tracked_version')
     WHERE ts >= ?
     GROUP BY bucket
     ORDER BY bucket ASC
@@ -817,16 +875,16 @@ app.get('/v1/stats/survey', adminLimiter, requireAdmin, (req, res) => {
     const spec = parseSpec(r);
     if (!spec) continue;
     const counts = db.prepare(`
-      SELECT answer, COUNT(*) AS n FROM survey_answers WHERE question_id = ? GROUP BY answer
+      SELECT answer, COUNT(*) AS n FROM v_survey_answers WHERE question_id = ? GROUP BY answer
     `).all(r.id);
     const byLang = db.prepare(`
       SELECT COALESCE(NULLIF(lang, ''), 'unknown') AS lang, COUNT(DISTINCT submission) AS n
-      FROM survey_answers WHERE question_id = ? GROUP BY lang ORDER BY n DESC
+      FROM v_survey_answers WHERE question_id = ? GROUP BY lang ORDER BY n DESC
     `).all(r.id);
     /* Les repondants se comptent en `submission` distincts, pas en lignes : une
        question multi-select produit plusieurs lignes pour une seule personne. */
     const respondents = db.prepare(`
-      SELECT COUNT(DISTINCT submission) AS n FROM survey_answers WHERE question_id = ?
+      SELECT COUNT(DISTINCT submission) AS n FROM v_survey_answers WHERE question_id = ?
     `).get(r.id).n;
 
     const entry = {
@@ -853,7 +911,7 @@ app.get('/v1/stats/live', adminLimiter, requireAdmin, (req, res) => res.json(liv
 app.get('/v1/stats/today', adminLimiter, requireAdmin, (req, res) => {
   const startOfDay = new Date();
   startOfDay.setHours(0, 0, 0, 0);
-  const n = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM sessions WHERE start_ts >= ?`).get(startOfDay.getTime()).n;
+  const n = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions WHERE start_ts >= ?`).get(startOfDay.getTime()).n;
   res.json({ today: n });
 });
 
@@ -901,7 +959,7 @@ app.get('/v1/players/discord', gameLimiter, (req, res) => {
 
 app.get('/v1/players/zones', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`
-    SELECT player_id, last_zone FROM sessions
+    SELECT player_id, last_zone FROM v_sessions
     GROUP BY player_id HAVING last_seen = MAX(last_seen)
   `).all();
   const result = {};
@@ -910,7 +968,7 @@ app.get('/v1/players/zones', adminLimiter, requireAdmin, (req, res) => {
 });
 app.get('/v1/reports', adminLimiter, requireAdmin, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
-  const rows = db.prepare(`SELECT id, player_id, error, stack, zone, version, platform, screenshot, ts FROM bug_reports ORDER BY ts DESC LIMIT ?`).all(limit);
+  const rows = db.prepare(`SELECT id, player_id, error, stack, zone, version, platform, screenshot, ts FROM v_bug_reports ORDER BY ts DESC LIMIT ?`).all(limit);
   res.json({ reports: rows });
 });
 
@@ -973,7 +1031,8 @@ app.post('/v1/admin/reset', adminLimiter, requireAdmin, (req, res) => {
     for (const t of STAT_TABLES) deleted[t] = db.prepare('DELETE FROM ' + t).run().changes;
     // record_concurrent est une mesure, pas un reglage : il repart avec le reste.
     // Les autres cles de meta (manifeste de maj, libelles de zones) restent.
-    deleted.record_concurrent = db.prepare("DELETE FROM meta WHERE k = 'record_concurrent'").run().changes;
+    // le record global et les 'record_concurrent:<version>' partent ensemble
+    deleted.record_concurrent = db.prepare("DELETE FROM meta WHERE k = 'record_concurrent' OR k LIKE 'record_concurrent:%'").run().changes;
   })();
 
   // Sans VACUUM le fichier garde la taille des donnees effacees sur le volume.
@@ -982,6 +1041,18 @@ app.post('/v1/admin/reset', adminLimiter, requireAdmin, (req, res) => {
   try { db.exec('VACUUM'); } catch (e) { vacuumed = false; }
 
   res.json({ ok: true, deleted, vacuumed });
+});
+
+/* Version affichee par le dashboard. Corps vide ou "all" pour tout revoir. */
+app.get('/v1/admin/tracked-version', adminLimiter, requireAdmin, (req, res) => {
+  res.json({ trackedVersion: trackedVersion() });
+});
+
+app.put('/v1/admin/tracked-version', adminLimiter, requireAdmin, (req, res) => {
+  const v = String((req.body && req.body.version) || '').trim().slice(0, 32);
+  if (!v || v === 'all') db.prepare("DELETE FROM meta WHERE k = 'tracked_version'").run();
+  else setMeta.run('tracked_version', v);
+  res.json({ ok: true, trackedVersion: trackedVersion() });
 });
 
 app.get('/v1/stats/dropoff', adminLimiter, requireAdmin, (req, res) => {
@@ -1001,7 +1072,7 @@ app.get('/v1/stats/newplayers', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`
     WITH firsts AS (
       SELECT player_id, MIN(start_ts) AS first_ts
-      FROM sessions
+      FROM v_sessions
       GROUP BY player_id
     )
     SELECT strftime('%Y-%m-%d', first_ts / 1000, 'unixepoch', 'localtime') AS day,
@@ -1017,7 +1088,7 @@ app.get('/v1/stats/newplayers', adminLimiter, requireAdmin, (req, res) => {
 app.get('/v1/stats/platforms', adminLimiter, requireAdmin, (req, res) => {
   const totalRows = db.prepare(`
     SELECT platform, COUNT(DISTINCT player_id) AS players
-    FROM sessions WHERE platform IS NOT NULL GROUP BY platform
+    FROM v_sessions WHERE platform IS NOT NULL GROUP BY platform
   `).all();
   const total = {};
   for (const r of totalRows) total[r.platform] = r.players;
@@ -1025,7 +1096,7 @@ app.get('/v1/stats/platforms', adminLimiter, requireAdmin, (req, res) => {
   const cutoff = Date.now() - ACTIVE_WINDOW_MS;
   const onlineRows = db.prepare(`
     SELECT platform, COUNT(*) AS online
-    FROM sessions WHERE end_ts IS NULL AND last_seen >= ? AND platform IS NOT NULL GROUP BY platform
+    FROM v_sessions WHERE end_ts IS NULL AND last_seen >= ? AND platform IS NOT NULL GROUP BY platform
   `).all(cutoff);
   const online = {};
   for (const r of onlineRows) online[r.platform] = r.online;
@@ -1044,7 +1115,7 @@ app.get('/v1/stats/languages', adminLimiter, requireAdmin, (req, res) => {
              ELSE LOWER(game_lang)
            END AS lang,
            COUNT(DISTINCT player_id) AS players
-    FROM sessions
+    FROM v_sessions
     GROUP BY lang
   `).all();
   const languages = {};
@@ -1117,12 +1188,12 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
 
   const byMap = db.prepare(`
     SELECT map_id, COUNT(*) AS count, COUNT(DISTINCT player_id) AS players
-    FROM deaths WHERE map_id IS NOT NULL GROUP BY map_id ORDER BY count DESC
+    FROM v_deaths WHERE map_id IS NOT NULL GROUP BY map_id ORDER BY count DESC
   `).all();
 
   const byEnemy = db.prepare(`
     SELECT enemy, COUNT(*) AS count, COUNT(DISTINCT player_id) AS players
-    FROM deaths WHERE enemy IS NOT NULL AND enemy != '' GROUP BY enemy ORDER BY count DESC
+    FROM v_deaths WHERE enemy IS NOT NULL AND enemy != '' GROUP BY enemy ORDER BY count DESC
   `).all();
 
   /* Classement de l'ennemi PRECIS, et non de sa famille : deux Nymphes du meme
@@ -1134,7 +1205,7 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
   const byInstance = db.prepare(`
     SELECT map_id, enemy_event_id, MAX(enemy_instance) AS name, enemy AS family,
            COUNT(*) AS count, COUNT(DISTINCT player_id) AS players
-    FROM deaths
+    FROM v_deaths
     WHERE enemy_event_id IS NOT NULL
     GROUP BY map_id, enemy_event_id
     ORDER BY count DESC
@@ -1146,10 +1217,10 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
      L'ennemi retenu est celui qui tue le plus souvent a cet endroit precis. */
   const points = db.prepare(`
     SELECT map_id, x, y, COUNT(*) AS count,
-           (SELECT d2.enemy FROM deaths d2
+           (SELECT d2.enemy FROM v_deaths d2
              WHERE d2.map_id = d.map_id AND d2.x = d.x AND d2.y = d.y AND d2.enemy IS NOT NULL
              GROUP BY d2.enemy ORDER BY COUNT(*) DESC LIMIT 1) AS enemy
-    FROM deaths d
+    FROM v_deaths d
     WHERE x IS NOT NULL AND y IS NOT NULL AND (@map_id IS NULL OR map_id = @map_id)
     GROUP BY map_id, x, y
     ORDER BY count DESC
@@ -1163,7 +1234,7 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
     SELECT COUNT(*) AS n,
            COUNT(DISTINCT player_id) AS players,
            SUM(CASE WHEN fatal = 1 THEN 1 ELSE 0 END) AS fatal
-    FROM deaths
+    FROM v_deaths
   `).get();
 
   res.json({
@@ -1176,21 +1247,21 @@ app.get('/v1/stats/endings', adminLimiter, requireAdmin, (req, res) => {
   /* On compte des JOUEURS, pas des lignes : « 50% fin Chad » parle de gens, et
      un meme joueur peut rejouer et revoir la meme fin dix fois. */
   const rows = db.prepare(`
-    SELECT ending, COUNT(DISTINCT player_id) AS players FROM endings GROUP BY ending
+    SELECT ending, COUNT(DISTINCT player_id) AS players FROM v_endings GROUP BY ending
   `).all();
   const endings = {};
   for (const r of rows) endings[r.ending] = r.players;
 
-  const reached = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM endings`).get().n;
+  const reached = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_endings`).get().n;
 
   const favRows = db.prepare(`
-    SELECT favourite, COUNT(*) AS n FROM endings
+    SELECT favourite, COUNT(*) AS n FROM v_endings
     WHERE favourite IS NOT NULL AND favourite != '' GROUP BY favourite ORDER BY n DESC
   `).all();
   const favourites = {};
   for (const r of favRows) favourites[r.favourite] = r.n;
 
-  const choiceRows = db.prepare(`SELECT choice, COUNT(*) AS n FROM gameover_choices GROUP BY choice`).all();
+  const choiceRows = db.prepare(`SELECT choice, COUNT(*) AS n FROM v_gameover_choices GROUP BY choice`).all();
   const afterDeath = {};
   for (const r of choiceRows) afterDeath[r.choice] = r.n;
 
@@ -1204,7 +1275,7 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
            AVG(end_ts - start_ts) AS avg_ms,
            SUM(end_ts - start_ts) AS total_ms,
            MAX(end_ts - start_ts) AS longest_ms
-    FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
+    FROM v_sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
   `).get();
 
   // Median duration of finished sessions (middle value; avg of two middles if even count).
@@ -1215,7 +1286,7 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
     const lim = (n % 2 === 0) ? 2 : 1;
     const mids = db.prepare(`
       SELECT (end_ts - start_ts) AS d
-      FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
+      FROM v_sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts
       ORDER BY d ASC LIMIT ? OFFSET ?
     `).all(lim, off);
     if (mids.length) medianMs = mids.reduce((a, r) => a + r.d, 0) / mids.length;
@@ -1227,7 +1298,7 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
   const cutoff = now - ACTIVE_WINDOW_MS;
   const active = db.prepare(`
     SELECT SUM(? - start_ts) AS ongoing_ms
-    FROM sessions WHERE end_ts IS NULL AND last_seen >= ? AND start_ts <= ?
+    FROM v_sessions WHERE end_ts IS NULL AND last_seen >= ? AND start_ts <= ?
   `).get(now, cutoff, now);
 
   const totalMs = (finished.total_ms || 0) + (active.ongoing_ms || 0);
@@ -1245,28 +1316,28 @@ app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
 app.get('/v1/stats/completion', adminLimiter, requireAdmin, (req, res) => {
   const bothBranches = db.prepare(`
     SELECT COUNT(*) AS n FROM (
-      SELECT player_id FROM events WHERE zone='jeu2_gauche'
+      SELECT player_id FROM v_events WHERE zone='jeu2_gauche'
       INTERSECT
-      SELECT player_id FROM events WHERE zone='jeu2_droite'
+      SELECT player_id FROM v_events WHERE zone='jeu2_droite'
     )
   `).get().n;
   const gaucheOnly = db.prepare(`
     SELECT COUNT(*) AS n FROM (
-      SELECT player_id FROM events WHERE zone='jeu2_gauche'
+      SELECT player_id FROM v_events WHERE zone='jeu2_gauche'
       EXCEPT
-      SELECT player_id FROM events WHERE zone='jeu2_droite'
+      SELECT player_id FROM v_events WHERE zone='jeu2_droite'
     )
   `).get().n;
   const droiteOnly = db.prepare(`
     SELECT COUNT(*) AS n FROM (
-      SELECT player_id FROM events WHERE zone='jeu2_droite'
+      SELECT player_id FROM v_events WHERE zone='jeu2_droite'
       EXCEPT
-      SELECT player_id FROM events WHERE zone='jeu2_gauche'
+      SELECT player_id FROM v_events WHERE zone='jeu2_gauche'
     )
   `).get().n;
   const maps = db.prepare(`
     SELECT map_id, COUNT(DISTINCT player_id) AS players
-    FROM events WHERE map_id IN (19,21,22,28,29,23,24,25,26,27,30,31)
+    FROM v_events WHERE map_id IN (19,21,22,28,29,23,24,25,26,27,30,31)
     GROUP BY map_id ORDER BY map_id
   `).all();
   res.json({ bothBranches, gaucheOnly, droiteOnly, maps });
@@ -1276,14 +1347,14 @@ app.get('/v1/stats/completion', adminLimiter, requireAdmin, (req, res) => {
 app.get('/v1/stats/progression', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`
     SELECT zone, COUNT(DISTINCT player_id) AS players
-    FROM events WHERE zone IS NOT NULL AND zone != '' AND zone != 'unknown'
+    FROM v_events WHERE zone IS NOT NULL AND zone != '' AND zone != 'unknown'
     GROUP BY zone
   `).all();
   const byZone = {};
   for (const r of rows) byZone[r.zone] = r.players;
-  const eventsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM events`).get().n;
-  const sessionsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM sessions`).get().n;
-  const eventsTotal = db.prepare(`SELECT COUNT(*) AS n FROM events`).get().n;
+  const eventsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_events`).get().n;
+  const sessionsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions`).get().n;
+  const eventsTotal = db.prepare(`SELECT COUNT(*) AS n FROM v_events`).get().n;
   res.json({ byZone, eventsPlayers, sessionsPlayers, eventsTotal });
 });
 
@@ -1304,7 +1375,7 @@ app.get('/v1/stats/sessions/distribution', adminLimiter, requireAdmin, (req, res
              ELSE                   '10 >24h'
            END AS bucket,
            COUNT(*) AS n
-    FROM (SELECT (end_ts - start_ts) AS d FROM sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts)
+    FROM (SELECT (end_ts - start_ts) AS d FROM v_sessions WHERE end_ts IS NOT NULL AND end_ts > start_ts)
     GROUP BY bucket
     ORDER BY bucket ASC
   `).all();
@@ -1341,8 +1412,11 @@ app.put('/v1/admin/zones', adminLimiter, requireAdmin, (req, res) => {
 // ---------- Snapshot cron ----------
 function takeSnapshot() {
   const cutoff = Date.now() - ACTIVE_WINDOW_MS;
-  const n = db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE last_seen >= ? AND end_ts IS NULL`).get(cutoff).n;
-  db.prepare(`INSERT OR REPLACE INTO concurrent_snapshots(ts, count) VALUES (?, ?)`).run(Date.now(), n);
+  /* Le compteur suit la version affichee : la courbe historique de la version
+     en cours demarre donc au premier releve, les anciens points restant
+     globaux (version NULL) et sortant du champ des qu'une version est suivie. */
+  const n = db.prepare(`SELECT COUNT(*) AS n FROM v_sessions WHERE last_seen >= ? AND end_ts IS NULL`).get(cutoff).n;
+  db.prepare(`INSERT OR REPLACE INTO concurrent_snapshots(ts, count, version) VALUES (?, ?, ?)`).run(Date.now(), n, trackedVersion());
   // retention 60 days
   db.prepare(`DELETE FROM concurrent_snapshots WHERE ts < ?`).run(Date.now() - 60 * 24 * 3600 * 1000);
 }
