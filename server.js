@@ -560,9 +560,9 @@ function concurrentHistory(rangeMs, bucketMs) {
   return db.prepare(`
     SELECT (ts / ?) * ? AS bucket, MAX(count) AS count
     FROM concurrent_snapshots
-    WHERE (SELECT v FROM meta WHERE k = 'tracked_version') IS NULL
-       OR version = (SELECT v FROM meta WHERE k = 'tracked_version')
     WHERE ts >= ?
+      AND ((SELECT v FROM meta WHERE k = 'tracked_version') IS NULL
+           OR version = (SELECT v FROM meta WHERE k = 'tracked_version'))
     GROUP BY bucket
     ORDER BY bucket ASC
   `).all(bucketMs, bucketMs, since);
