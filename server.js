@@ -375,7 +375,11 @@ app.use(express.json({ limit: '5mb' }));
 
 const eventLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 const gameLimiter  = rateLimit({ windowMs: 60 * 1000, max: 30 });
-const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
+/* Le dashboard interroge une quinzaine de panneaux en continu : a 60 req/min il
+   depassait son propre quota en regime normal, et les panneaux rejetes
+   echouaient en silence. Ces routes exigent deja le token admin, le limiteur
+   est la contre le brute force, pas contre le proprietaire. */
+const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 600 });
 
 app.get('/health', (req, res) => res.json({ ok: true, uptimeSec: Math.round(process.uptime()) }));
 
