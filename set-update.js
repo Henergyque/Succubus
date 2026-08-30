@@ -49,32 +49,53 @@ if (args.length === 0 || args.length % 2 !== 0) {
   process.exit(1);
 }
 
-const files = [];
+// Hash is computed from the URL content (what players actually download)
+// to avoid CRLF mismatches from git line-ending conversions.
+const filePairs = [];
 for (let i = 0; i < args.length; i += 2) {
-  const localPath = args[i];
+  const localPath   = args[i];
   const downloadUrl = args[i + 1];
-
-  if (!fs.existsSync(localPath)) {
-    console.error('File not found:', localPath);
-    process.exit(1);
-  }
-
-  const content = fs.readFileSync(localPath);
-  const sha256  = crypto.createHash('sha256').update(content).digest('hex');
+  if (!fs.existsSync(localPath)) { console.error('File not found:', localPath); process.exit(1); }
   const relPath = localPath.replace(/\\/g, '/').replace(/^.*?www\//, 'www/');
-
-  files.push({ path: relPath, url: downloadUrl, sha256 });
-  console.log(`  ${relPath}`);
-  console.log(`  sha256: ${sha256}`);
+  filePairs.push({ relPath, downloadUrl });
 }
 
-const manifest = { version, files };
-console.log('\nPublishing manifest:', JSON.stringify(manifest, null, 2));
+let pending = filePairs.length;
+const files = [];
 
-sendRequest('POST', '/v1/game/update', { manifest }, (err, data) => {
-  if (err) { console.error('Error:', err); process.exit(1); }
-  console.log('✓ Manifest published. Players will receive this update on next launch.');
+filePairs.forEach(({ relPath, downloadUrl }) => {
+  fetchRaw(downloadUrl, (err, content) => {
+    if (err) { console.error('Failed to fetch', downloadUrl, err); process.exit(1); }
+    const sha256 = crypto.createHash('sha256').update(content).digest('hex');
+    files.push({ path: relPath, url: downloadUrl, sha256 });
+    console.log(`  ${relPath}`);
+    console.log(`  sha256: ${sha256}`);
+    if (--pending === 0) publish();
+  });
 });
+
+function publish() {
+  const manifest = { version, files };
+  console.log('\nPublishing manifest:', JSON.stringify(manifest, null, 2));
+  sendRequest('POST', '/v1/game/update', { manifest }, (err) => {
+    if (err) { console.error('Error:', err); process.exit(1); }
+    console.log('✓ Manifest published. Players will receive this update on next launch.');
+  });
+}
+
+function fetchRaw(urlStr, cb) {
+  const parsed = new url.URL(urlStr);
+  const isHttps = parsed.protocol === 'https:';
+  const transport = isHttps ? https : http;
+  const req = transport.request({ hostname: parsed.hostname, port: parsed.port || (isHttps ? 443 : 80), path: parsed.pathname + (parsed.search || ''), method: 'GET' }, (res) => {
+    if (res.statusCode === 301 || res.statusCode === 302) return fetchRaw(res.headers.location, cb);
+    const chunks = [];
+    res.on('data', c => chunks.push(c));
+    res.on('end', () => cb(null, Buffer.concat(chunks)));
+  });
+  req.on('error', e => cb(e.message));
+  req.end();
+}
 
 // --- Helpers ---
 function sendRequest(method, pathname, body, cb) {
