@@ -1402,47 +1402,86 @@ app.get('/v1/stats/endings', adminLimiter, requireAdmin, (req, res) => {
   const afterDeath = {};
   for (const r of choiceRows) afterDeath[r.choice] = r.n;
 
-  res.json({ endings, reached, favourites, afterDeath });
+  /* La reponse « Who was your favourite? » n'est reellement captee qu'a partir
+     de la 0.5.1 (le hook des versions precedentes ne se declenchait jamais). */
+  res.json({ endings, reached, favourites, afterDeath,
+    favouriteSince: TRACKED_SINCE_051, favouriteNotTracked: trackedBefore(TRACKED_SINCE_051) });
 });
+
+/* Suivis apparus en 0.5.1 (bonus, clics sur les liens). Les joueurs des
+   versions anterieures n'ont jamais pu les remonter : les compter au
+   denominateur ecraserait les pourcentages en vue « toutes versions », et en
+   vue 0.4.1 il n'y a tout simplement rien a mesurer. */
+const TRACKED_SINCE_051 = '0.5.1';
+const cmpVer = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
+
+/* Clause « version IN (...) » limitee aux versions >= minVersion, pour la vue
+   toutes versions. Avec une version suivie, les vues v_* filtrent deja : la
+   clause est vide. Numerateur et denominateur passent par la meme, sans quoi un
+   pourcentage pourrait depasser 100 %. */
+function sinceClause(minVersion, col) {
+  if (trackedVersion()) return { sql: '1=1', params: [] };
+  const versions = db.prepare(`SELECT DISTINCT version FROM sessions WHERE version IS NOT NULL`).all()
+    .map((r) => r.version).filter((v) => cmpVer(v, minVersion) >= 0);
+  if (!versions.length) return { sql: '0=1', params: [] };
+  return { sql: (col || 'version') + ' IN (' + versions.map(() => '?').join(',') + ')', params: versions };
+}
+
+function playersSince(minVersion) {
+  const tv = trackedVersion();
+  if (tv && cmpVer(tv, minVersion) < 0) return 0;
+  const c = sinceClause(minVersion);
+  return db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions WHERE ` + c.sql).get(...c.params).n;
+}
+
+// la version suivie est-elle anterieure au suivi ? (null = toutes versions)
+function trackedBefore(minVersion) {
+  const tv = trackedVersion();
+  return !!tv && cmpVer(tv, minVersion) < 0;
+}
 
 /* Bonus : part des joueurs de la version suivie qui ont trouve chacun d'eux.
    Le denominateur est le nombre de joueurs distincts de la version (sessions),
    pas ceux qui ont trouve au moins un bonus : c'est la visibilite du bonus
    aupres de TOUS les joueurs qu'on veut mesurer. */
 app.get('/v1/stats/bonuses', adminLimiter, requireAdmin, (req, res) => {
+  const c = sinceClause(TRACKED_SINCE_051);
   const rows = db.prepare(`
     SELECT bonus, COUNT(DISTINCT player_id) AS players, MAX(map_id) AS mapId
-    FROM v_bonuses GROUP BY bonus ORDER BY bonus
-  `).all();
-  const totalPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions`).get().n;
-  const collectors = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_bonuses`).get().n;
+    FROM v_bonuses WHERE ` + c.sql + ` GROUP BY bonus ORDER BY bonus
+  `).all(...c.params);
+  const totalPlayers = playersSince(TRACKED_SINCE_051);
+  const collectors = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_bonuses WHERE ` + c.sql).get(...c.params).n;
   const perPlayer = db.prepare(`
     SELECT n AS found, COUNT(*) AS players FROM (
-      SELECT player_id, COUNT(DISTINCT bonus) AS n FROM v_bonuses GROUP BY player_id
+      SELECT player_id, COUNT(DISTINCT bonus) AS n FROM v_bonuses WHERE ` + c.sql + ` GROUP BY player_id
     ) GROUP BY n ORDER BY n
-  `).all();
-  res.json({ totalPlayers, collectors, bonuses: rows, perPlayer });
+  `).all(...c.params);
+  res.json({ totalPlayers, collectors, bonuses: rows, perPlayer,
+    trackedSince: TRACKED_SINCE_051, notTracked: trackedBefore(TRACKED_SINCE_051) });
 });
 
 /* Clics sur les liens : cumul par cible et par provenance, et pour les dix
    dernieres annonces le rapport clics / affichages. */
 app.get('/v1/stats/links', adminLimiter, requireAdmin, (req, res) => {
+  const c = sinceClause(TRACKED_SINCE_051);
   const byTarget = db.prepare(`
     SELECT target, COUNT(*) AS clicks, COUNT(DISTINCT player_id) AS players
-    FROM v_link_clicks GROUP BY target ORDER BY clicks DESC
-  `).all();
+    FROM v_link_clicks WHERE ` + c.sql + ` GROUP BY target ORDER BY clicks DESC
+  `).all(...c.params);
   const bySource = db.prepare(`
     SELECT source, target, COUNT(*) AS clicks
-    FROM v_link_clicks GROUP BY source, target ORDER BY clicks DESC
-  `).all();
+    FROM v_link_clicks WHERE ` + c.sql + ` GROUP BY source, target ORDER BY clicks DESC
+  `).all(...c.params);
   /* view_count / click_count sont des compteurs bruts, sans version : une
      annonce est une, quelle que soit la version de qui la lit. */
   const announcements = db.prepare(`
     SELECT id, title, url, created_at AS createdAt, view_count AS views, click_count AS clicks, active
     FROM announcements ORDER BY created_at DESC LIMIT 10
   `).all();
-  const totalPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions`).get().n;
-  res.json({ byTarget, bySource, announcements, totalPlayers });
+  const totalPlayers = playersSince(TRACKED_SINCE_051);
+  res.json({ byTarget, bySource, announcements, totalPlayers,
+    trackedSince: TRACKED_SINCE_051, notTracked: trackedBefore(TRACKED_SINCE_051) });
 });
 
 app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
