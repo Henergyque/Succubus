@@ -173,6 +173,37 @@ CREATE TABLE IF NOT EXISTS survey_answers (
   platform TEXT
 );
 
+/* Bonus ramasses (0.5.1). Une ligne par joueur, par bonus et par version :
+   « quelle part des joueurs a trouve le Bonus 7 » se lit en joueurs, pas en
+   evenements, et un joueur qui recharge sa partie ne doit pas compter deux
+   fois. Le jeu redeclare aussi les bonus deja possedes au chargement d'une
+   save, d'ou l'INSERT OR IGNORE sur la cle unique. */
+CREATE TABLE IF NOT EXISTS bonuses (
+  player_id TEXT NOT NULL,
+  bonus INTEGER NOT NULL,
+  map_id INTEGER,
+  ts INTEGER NOT NULL,
+  version TEXT NOT NULL,
+  UNIQUE (player_id, bonus, version)
+);
+
+/* Clics sur les liens externes du jeu (Discord / Patreon / Itch de l'ecran
+   titre, Patreon de l'ecran de sortie, bouton d'une annonce ou du changelog).
+   Hors purge des 30 jours comme les tables ci-dessus : c'est ce qui dit si un
+   lien dans une annonce vaut le coup. */
+CREATE TABLE IF NOT EXISTS link_clicks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  player_id TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  target TEXT NOT NULL,
+  source TEXT,
+  announcement_id INTEGER,
+  version TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_bonuses_bonus ON bonuses(bonus);
+CREATE INDEX IF NOT EXISTS idx_link_clicks_target ON link_clicks(target);
+CREATE INDEX IF NOT EXISTS idx_link_clicks_ann ON link_clicks(announcement_id);
 CREATE INDEX IF NOT EXISTS idx_bug_reports_ts ON bug_reports(ts);
 CREATE INDEX IF NOT EXISTS idx_announcements_created ON announcements(created_at);
 CREATE INDEX IF NOT EXISTS idx_deaths_map ON deaths(map_id);
@@ -233,6 +264,8 @@ function addColumnIfMissing(table, column, decl) {
 // que pour les lignes ecrites a partir de maintenant.
 addColumnIfMissing('gameover_choices', 'version', 'TEXT');
 addColumnIfMissing('concurrent_snapshots', 'version', 'TEXT');
+// clics sur le bouton « Voir les details » d'une annonce (0.5.1)
+addColumnIfMissing('announcements', 'click_count', 'INTEGER NOT NULL DEFAULT 0');
 
 const TRACKED = "(SELECT v FROM meta WHERE k = 'tracked_version')";
 
@@ -244,7 +277,7 @@ function defineView(name, body) {
 }
 
 // tables portant directement la version
-for (const t of ['sessions', 'deaths', 'endings', 'survey_answers', 'bug_reports', 'gameover_choices']) {
+for (const t of ['sessions', 'deaths', 'endings', 'survey_answers', 'bug_reports', 'gameover_choices', 'bonuses', 'link_clicks']) {
   defineView('v_' + t,
     'SELECT x.* FROM ' + t + ' x WHERE ' + TRACKED + ' IS NULL OR x.version = ' + TRACKED);
 }
@@ -299,6 +332,21 @@ const insertGameoverChoice = db.prepare(`
   INSERT INTO gameover_choices (player_id, ts, choice, version) VALUES (@player_id, @ts, @choice, @version)
 `);
 
+const insertBonus = db.prepare(`
+  INSERT OR IGNORE INTO bonuses (player_id, bonus, map_id, ts, version)
+  VALUES (@player_id, @bonus, @map_id, @ts, @version)
+`);
+
+const insertLinkClick = db.prepare(`
+  INSERT INTO link_clicks (player_id, ts, target, source, announcement_id, version)
+  VALUES (@player_id, @ts, @target, @source, @announcement_id, @version)
+`);
+
+const incrementClickCount = db.prepare(`UPDATE announcements SET click_count = click_count + 1 WHERE id = ?`);
+
+// liens que le jeu sait ouvrir : tout le reste est ignore plutot que stocke
+const LINK_TARGETS = new Set(['discord', 'patreon', 'itch', 'announcement', 'changelog']);
+
 // ---------- Sondages ----------
 const getActiveQuestions = db.prepare(`SELECT id, spec FROM survey_questions WHERE active = 1 ORDER BY sort_order, created_at`);
 const getAllQuestions = db.prepare(`
@@ -322,7 +370,7 @@ const insertAnswer = db.prepare(`
 const getMeta = db.prepare(`SELECT v FROM meta WHERE k=?`);
 const setMeta = db.prepare(`INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`);
 
-const getAnnouncement = db.prepare(`SELECT id, title, body, url, type, version, expiresAt, created_at, view_count FROM announcements WHERE active = 1 ORDER BY created_at DESC LIMIT 1`);
+const getAnnouncement = db.prepare(`SELECT id, title, body, url, type, version, expiresAt, created_at, view_count, click_count FROM announcements WHERE active = 1 ORDER BY created_at DESC LIMIT 1`);
 const incrementViewCount = db.prepare(`UPDATE announcements SET view_count = view_count + 1 WHERE id = ?`);
 const insertAnnouncement = db.prepare(`INSERT INTO announcements (title, body, url, type, version, expiresAt, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`);
 const deactivateAnnouncements = db.prepare(`UPDATE announcements SET active = 0 WHERE active = 1`);
@@ -341,7 +389,8 @@ function currentAnnouncement() {
     version: row.version,
     expiresAt: row.expiresAt,
     createdAt: row.created_at,
-    viewCount: row.view_count || 0
+    viewCount: row.view_count || 0,
+    clickCount: row.click_count || 0
   };
 }
 
@@ -476,6 +525,32 @@ app.post('/v1/event', eventLimiter, (req, res) => {
           const gvrow = getSessionVersion.get(sid);
           insertGameoverChoice.run({ player_id: pid, ts, choice, version: gvrow ? gvrow.version : null });
         }
+      } else if (type === 'bonus' || type === 'bonus_sync') {
+        /* `bonus` : ramasse a l'instant. `bonus_sync` : deja possedes dans la
+           save qu'on vient de charger. Meme table, la cle unique absorbe les
+           redites. Version manquante = session sans session_start, inclassable
+           dans les vues mais pas une raison de perdre la ligne. */
+        const bvrow = getSessionVersion.get(sid);
+        const version = (bvrow && bvrow.version) || 'unknown';
+        const list = type === 'bonus' ? [e.bonus] : (Array.isArray(e.bonuses) ? e.bonuses.slice(0, 50) : []);
+        for (const b of list) {
+          const n = num(b);
+          if (n === null || n < 1 || n > 99) continue;
+          insertBonus.run({ player_id: pid, bonus: n, map_id: type === 'bonus' ? mapId : null, ts, version });
+        }
+      } else if (type === 'link_click') {
+        const target = txt(e.target, 16);
+        if (target && LINK_TARGETS.has(target)) {
+          const lvrow = getSessionVersion.get(sid);
+          const annId = num(e.announcementId);
+          insertLinkClick.run({
+            player_id: pid, ts, target,
+            source: txt(e.source, 16),
+            announcement_id: annId,
+            version: lvrow ? lvrow.version : null
+          });
+          if (annId !== null) incrementClickCount.run(annId);
+        }
       }
 
       dirtyTypes.add(type);
@@ -563,8 +638,9 @@ function liveStats() {
   };
 }
 
+// rangeMs = Infinity : depuis toujours (les sessions ne sont jamais purgees)
 function dropoffStats(rangeMs) {
-  const since = Date.now() - rangeMs;
+  const since = Number.isFinite(rangeMs) ? Date.now() - rangeMs : 0;
   const ended = db.prepare(`
     SELECT last_zone AS zone, last_map_id AS mapId, COUNT(*) AS n
     FROM v_sessions
@@ -1043,7 +1119,9 @@ const STAT_TABLES = [
   'deaths',
   'endings',
   'gameover_choices',
-  'survey_answers'
+  'survey_answers',
+  'bonuses',
+  'link_clicks'
 ];
 
 // Archive complete des mesures, a prendre AVANT un reset : une fois les tables
@@ -1100,7 +1178,11 @@ app.put('/v1/admin/tracked-version', adminLimiter, requireAdmin, (req, res) => {
 });
 
 app.get('/v1/stats/dropoff', adminLimiter, requireAdmin, (req, res) => {
-  const range = Math.max(1, Math.min(parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10), 90 * 24 * 3600 * 1000));
+  /* rangeMs=all : drop-off depuis toujours, pour localiser les cartes ou les
+     joueurs decrochent sans dependre de l'activite des dernieres 24 h. La vue
+     v_sessions le restreint deja a la version suivie. */
+  const range = req.query.rangeMs === 'all' ? Infinity
+    : Math.max(1, Math.min(parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10), 90 * 24 * 3600 * 1000));
   res.json(dropoffStats(range));
 });
 app.get('/v1/stats/concurrent', adminLimiter, requireAdmin, (req, res) => {
@@ -1235,10 +1317,14 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
     FROM v_deaths WHERE map_id IS NOT NULL GROUP BY map_id ORDER BY count DESC
   `).all();
 
+  /* Avec ?mapId= les classements ne portent que sur la carte affichee : dans
+     une grotte de Naiades, savoir qu'Oneira domine le Jeu 1 n'apprend rien.
+     byMap reste global, c'est lui qui alimente le selecteur de cartes. */
   const byEnemy = db.prepare(`
     SELECT enemy, COUNT(*) AS count, COUNT(DISTINCT player_id) AS players
-    FROM v_deaths WHERE enemy IS NOT NULL AND enemy != '' GROUP BY enemy ORDER BY count DESC
-  `).all();
+    FROM v_deaths WHERE enemy IS NOT NULL AND enemy != '' AND (@map_id IS NULL OR map_id = @map_id)
+    GROUP BY enemy ORDER BY count DESC
+  `).all({ map_id: mapId });
 
   /* Classement de l'ennemi PRECIS, et non de sa famille : deux Nymphes du meme
      type n'ont pas du tout le meme taux de capture selon ou elles patrouillent.
@@ -1250,11 +1336,11 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
     SELECT map_id, enemy_event_id, MAX(enemy_instance) AS name, enemy AS family,
            COUNT(*) AS count, COUNT(DISTINCT player_id) AS players
     FROM v_deaths
-    WHERE enemy_event_id IS NOT NULL
+    WHERE enemy_event_id IS NOT NULL AND (@map_id IS NULL OR map_id = @map_id)
     GROUP BY map_id, enemy_event_id
     ORDER BY count DESC
     LIMIT 40
-  `).all();
+  `).all({ map_id: mapId });
 
   /* Les croix de la carte. Agrege cote SQL : le dashboard recoit une position
      unique par case avec son poids, pas les dizaines de milliers de morts brutes.
@@ -1281,9 +1367,16 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
     FROM v_deaths
   `).get();
 
+  /* Denominateur des pourcentages du classement : toutes les captures de la
+     carte filtree (ou de tout le jeu sans filtre), coupable identifie ou non. */
+  const scopeRow = mapId === null ? totalRow : db.prepare(`
+    SELECT COUNT(*) AS n, COUNT(DISTINCT player_id) AS players FROM v_deaths WHERE map_id = ?
+  `).get(mapId);
+
   res.json({
     byMap, byEnemy, byInstance, points,
-    total: totalRow.n, players: totalRow.players, fatalTotal: totalRow.fatal || 0
+    total: totalRow.n, players: totalRow.players, fatalTotal: totalRow.fatal || 0,
+    mapId, scopeTotal: scopeRow.n, scopePlayers: scopeRow.players
   });
 });
 
@@ -1310,6 +1403,46 @@ app.get('/v1/stats/endings', adminLimiter, requireAdmin, (req, res) => {
   for (const r of choiceRows) afterDeath[r.choice] = r.n;
 
   res.json({ endings, reached, favourites, afterDeath });
+});
+
+/* Bonus : part des joueurs de la version suivie qui ont trouve chacun d'eux.
+   Le denominateur est le nombre de joueurs distincts de la version (sessions),
+   pas ceux qui ont trouve au moins un bonus : c'est la visibilite du bonus
+   aupres de TOUS les joueurs qu'on veut mesurer. */
+app.get('/v1/stats/bonuses', adminLimiter, requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT bonus, COUNT(DISTINCT player_id) AS players, MAX(map_id) AS mapId
+    FROM v_bonuses GROUP BY bonus ORDER BY bonus
+  `).all();
+  const totalPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions`).get().n;
+  const collectors = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_bonuses`).get().n;
+  const perPlayer = db.prepare(`
+    SELECT n AS found, COUNT(*) AS players FROM (
+      SELECT player_id, COUNT(DISTINCT bonus) AS n FROM v_bonuses GROUP BY player_id
+    ) GROUP BY n ORDER BY n
+  `).all();
+  res.json({ totalPlayers, collectors, bonuses: rows, perPlayer });
+});
+
+/* Clics sur les liens : cumul par cible et par provenance, et pour les dix
+   dernieres annonces le rapport clics / affichages. */
+app.get('/v1/stats/links', adminLimiter, requireAdmin, (req, res) => {
+  const byTarget = db.prepare(`
+    SELECT target, COUNT(*) AS clicks, COUNT(DISTINCT player_id) AS players
+    FROM v_link_clicks GROUP BY target ORDER BY clicks DESC
+  `).all();
+  const bySource = db.prepare(`
+    SELECT source, target, COUNT(*) AS clicks
+    FROM v_link_clicks GROUP BY source, target ORDER BY clicks DESC
+  `).all();
+  /* view_count / click_count sont des compteurs bruts, sans version : une
+     annonce est une, quelle que soit la version de qui la lit. */
+  const announcements = db.prepare(`
+    SELECT id, title, url, created_at AS createdAt, view_count AS views, click_count AS clicks, active
+    FROM announcements ORDER BY created_at DESC LIMIT 10
+  `).all();
+  const totalPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions`).get().n;
+  res.json({ byTarget, bySource, announcements, totalPlayers });
 });
 
 app.get('/v1/stats/sessions', adminLimiter, requireAdmin, (req, res) => {
@@ -1381,7 +1514,7 @@ app.get('/v1/stats/completion', adminLimiter, requireAdmin, (req, res) => {
   `).get().n;
   const maps = db.prepare(`
     SELECT map_id, COUNT(DISTINCT player_id) AS players
-    FROM v_events WHERE map_id IN (19,21,22,28,29,23,24,25,26,27,30,31)
+    FROM v_events WHERE map_id IN (19,21,22,28,29,23,24,25,26,27,30,31,32,33,34)
     GROUP BY map_id ORDER BY map_id
   `).all();
   res.json({ bothBranches, gaucheOnly, droiteOnly, maps });

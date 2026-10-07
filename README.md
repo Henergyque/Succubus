@@ -6,7 +6,10 @@ Backend for `SG_Telemetry.js` (in-game) and `SuccubusStats.exe` (owner dashboard
 
 - `POST /v1/event` — game sends batches of events. Header `X-Game-Token: <GAME_TOKEN>`.
 - `GET /v1/stats/live` — admin. Current online + per-zone + per-map.
-- `GET /v1/stats/dropoff?rangeMs=86400000` — admin. Top quit zones/maps.
+- `GET /v1/stats/dropoff?rangeMs=86400000` — admin. Top quit zones/maps. `rangeMs=all` = since forever.
+- `GET /v1/stats/deaths?mapId=24` — admin. Captures; with `mapId` the enemy rankings cover that map only.
+- `GET /v1/stats/bonuses` — admin. Share of players who found each bonus (events `bonus` / `bonus_sync`).
+- `GET /v1/stats/links` — admin. Clicks on in-game links (event `link_click`) and per-announcement click-through.
 - `GET /v1/stats/concurrent?rangeMs=86400000&bucketMs=300000` — admin. Historical curve.
 - `WS /v1/stream?token=<ADMIN_TOKEN>` — admin live push (snapshot on connect + on event).
 
