@@ -187,6 +187,17 @@ CREATE TABLE IF NOT EXISTS bonuses (
   UNIQUE (player_id, bonus, version)
 );
 
+/* Progression : une ligne par joueur et par zone atteinte (et par version).
+   Hors purge des 30 jours : c'est ce qui permet de dire « X % des joueurs ont
+   atteint Trial 2 » sur toute la duree du suivi. */
+CREATE TABLE IF NOT EXISTS player_zones (
+  player_id TEXT NOT NULL,
+  zone TEXT NOT NULL,
+  version TEXT NOT NULL,
+  first_ts INTEGER NOT NULL,
+  UNIQUE (player_id, zone, version)
+);
+
 /* Clics sur les liens externes du jeu (Discord / Patreon / Itch de l'ecran
    titre, Patreon de l'ecran de sortie, bouton d'une annonce ou du changelog).
    Hors purge des 30 jours comme les tables ci-dessus : c'est ce qui dit si un
@@ -277,7 +288,7 @@ function defineView(name, body) {
 }
 
 // tables portant directement la version
-for (const t of ['sessions', 'deaths', 'endings', 'survey_answers', 'bug_reports', 'gameover_choices', 'bonuses', 'link_clicks']) {
+for (const t of ['sessions', 'deaths', 'endings', 'survey_answers', 'bug_reports', 'gameover_choices', 'bonuses', 'link_clicks', 'player_zones']) {
   defineView('v_' + t,
     'SELECT x.* FROM ' + t + ' x WHERE ' + TRACKED + ' IS NULL OR x.version = ' + TRACKED);
 }
@@ -335,6 +346,11 @@ const insertGameoverChoice = db.prepare(`
 const insertBonus = db.prepare(`
   INSERT OR IGNORE INTO bonuses (player_id, bonus, map_id, ts, version)
   VALUES (@player_id, @bonus, @map_id, @ts, @version)
+`);
+
+const insertPlayerZone = db.prepare(`
+  INSERT OR IGNORE INTO player_zones (player_id, zone, version, first_ts)
+  VALUES (?, ?, ?, ?)
 `);
 
 const insertLinkClick = db.prepare(`
@@ -487,6 +503,11 @@ app.post('/v1/event', eventLimiter, (req, res) => {
       } else {
         ensureSessionRow.run({ id: sid, player_id: pid, ts, map_id: mapId, zone });
         updateSessionTick.run({ id: sid, ts, map_id: mapId, zone });
+      }
+
+      if (zone && zone !== 'unknown') {
+        const zvrow = getSessionVersion.get(sid);
+        insertPlayerZone.run(pid, zone, (zvrow && zvrow.version) || 'unknown', ts);
       }
 
       /* Progression cumulative. Ces trois types passent aussi par le tick de
@@ -1121,7 +1142,8 @@ const STAT_TABLES = [
   'gameover_choices',
   'survey_answers',
   'bonuses',
-  'link_clicks'
+  'link_clicks',
+  'player_zones'
 ];
 
 // Archive complete des mesures, a prendre AVANT un reset : une fois les tables
@@ -1155,6 +1177,8 @@ app.post('/v1/admin/reset', adminLimiter, requireAdmin, (req, res) => {
     // Les autres cles de meta (manifeste de maj, libelles de zones) restent.
     // le record global et les 'record_concurrent:<version>' partent ensemble
     deleted.record_concurrent = db.prepare("DELETE FROM meta WHERE k = 'record_concurrent' OR k LIKE 'record_concurrent:%'").run().changes;
+    // player_zones vient d'etre videe : le suivi de progression repart de maintenant
+    setMeta.run('progression_since', String(Date.now()));
   })();
 
   // Sans VACUUM le fichier garde la taille des donnees effacees sur le volume.
@@ -1559,19 +1583,41 @@ app.get('/v1/stats/completion', adminLimiter, requireAdmin, (req, res) => {
   res.json({ bothBranches, gaucheOnly, droiteOnly, maps });
 });
 
-// Progression funnel: distinct players who EVER reached each zone (from events).
+/* Debut du suivi de progression. Au premier demarrage avec player_zones, la
+   table est amorcee avec les events encore presents (30 derniers jours) : ce
+   sont des passages reels, rien n'est deduit. La date retenue est celle du plus
+   vieil event, en deca on n'a plus l'historique complet de personne. */
+if (!getMeta.get('progression_since')) {
+  db.transaction(() => {
+    const oldest = db.prepare(`SELECT MIN(ts) AS t FROM events`).get().t;
+    db.prepare(`
+      INSERT OR IGNORE INTO player_zones (player_id, zone, version, first_ts)
+      SELECT e.player_id, e.zone, COALESCE(s.version, 'unknown'), MIN(e.ts)
+      FROM events e LEFT JOIN sessions s ON s.id = e.session_id
+      WHERE e.zone IS NOT NULL AND e.zone NOT IN ('', 'unknown')
+      GROUP BY e.player_id, e.zone, COALESCE(s.version, 'unknown')
+    `).run();
+    setMeta.run('progression_since', String(oldest || Date.now()));
+  })();
+}
+
+/* Progression : part des joueurs ayant atteint chaque zone au moins une fois.
+   La base ne compte que les joueurs dont la toute premiere session est
+   posterieure au debut du suivi : un ancien joueur qui revient directement en
+   Trial 2 serait dans la base sans jamais apparaitre dans l'intro, et fausserait
+   tous les pourcentages. */
 app.get('/v1/stats/progression', adminLimiter, requireAdmin, (req, res) => {
+  const since = Number(getMeta.get('progression_since').v);
+  const NEW_PLAYERS = `(SELECT player_id FROM sessions GROUP BY player_id HAVING MIN(start_ts) >= ?)`;
   const rows = db.prepare(`
     SELECT zone, COUNT(DISTINCT player_id) AS players
-    FROM v_events WHERE zone IS NOT NULL AND zone != '' AND zone != 'unknown'
+    FROM v_player_zones WHERE player_id IN ${NEW_PLAYERS}
     GROUP BY zone
-  `).all();
+  `).all(since);
   const byZone = {};
   for (const r of rows) byZone[r.zone] = r.players;
-  const eventsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_events`).get().n;
-  const sessionsPlayers = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions`).get().n;
-  const eventsTotal = db.prepare(`SELECT COUNT(*) AS n FROM v_events`).get().n;
-  res.json({ byZone, eventsPlayers, sessionsPlayers, eventsTotal });
+  const base = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions WHERE player_id IN ${NEW_PLAYERS}`).get(since).n;
+  res.json({ byZone, base, since });
 });
 
 // Diagnostic: distribution of finished-session durations across buckets.
