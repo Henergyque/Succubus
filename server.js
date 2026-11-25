@@ -212,6 +212,33 @@ CREATE TABLE IF NOT EXISTS link_clicks (
   version TEXT
 );
 
+/* Paliers de l'histoire (0.5.5) : contrat d'Oneira, fin du Jeu 1, debut et fin
+   du Jeu 2, contrat de Saphia, debut du Jeu 3. Une ligne par joueur, palier et
+   version : « X % des joueurs ont signe le contrat » se lit en joueurs. Le jeu
+   redeclare les paliers deja atteints au chargement d'une save, d'ou la cle
+   unique. */
+CREATE TABLE IF NOT EXISTS milestones (
+  player_id TEXT NOT NULL,
+  milestone TEXT NOT NULL,
+  version TEXT NOT NULL,
+  first_ts INTEGER NOT NULL,
+  UNIQUE (player_id, milestone, version)
+);
+
+/* Captures a la fin d'un jeu (0.5.5) : valeur de « Capture Jeu N » (v15, v16…)
+   au moment ou le joueur termine le jeu N. Seuls ceux qui l'ont fini y sont,
+   et un seul releve par joueur, jeu et version (le premier). */
+CREATE TABLE IF NOT EXISTS captures (
+  player_id TEXT NOT NULL,
+  game INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  version TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  UNIQUE (player_id, game, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_milestones_m ON milestones(milestone);
+CREATE INDEX IF NOT EXISTS idx_captures_game ON captures(game);
 CREATE INDEX IF NOT EXISTS idx_bonuses_bonus ON bonuses(bonus);
 CREATE INDEX IF NOT EXISTS idx_link_clicks_target ON link_clicks(target);
 CREATE INDEX IF NOT EXISTS idx_link_clicks_ann ON link_clicks(announcement_id);
@@ -280,6 +307,21 @@ addColumnIfMissing('announcements', 'click_count', 'INTEGER NOT NULL DEFAULT 0')
 
 const TRACKED = "(SELECT v FROM meta WHERE k = 'tracked_version')";
 
+/* Editions : la version suivie peut aussi valoir 'demo' (tout ce qui precede la
+   0.6, c'est-a-dire la demo jusqu'a la 0.5.5) ou 'full' (0.6.X et apres). Les
+   vues se filtrent alors sur l'edition et tous les panneaux suivent sans qu'une
+   route ait a y penser. Une version illisible ('unknown', NULL) n'appartient a
+   aucune edition. */
+const EDITION_FULL_FROM = '0.6';
+const EDITIONS = new Set(['demo', 'full']);
+function editionOf(v) {
+  if (typeof v !== 'string' || !/^\d+(\.\d+)*/.test(v)) return null;
+  return String(v).localeCompare(EDITION_FULL_FROM, undefined, { numeric: true }) < 0 ? 'demo' : 'full';
+}
+db.function('sg_edition', { deterministic: true }, (v) => editionOf(v));
+const versionMatch = (col) => '(' + TRACKED + ' IS NULL OR ' + col + ' = ' + TRACKED +
+  ' OR (' + TRACKED + " IN ('demo','full') AND sg_edition(" + col + ') = ' + TRACKED + '))';
+
 /* Recrees a chaque demarrage : si la definition d'une vue change, un simple
    CREATE IF NOT EXISTS garderait silencieusement l'ancienne. */
 function defineView(name, body) {
@@ -288,15 +330,14 @@ function defineView(name, body) {
 }
 
 // tables portant directement la version
-for (const t of ['sessions', 'deaths', 'endings', 'survey_answers', 'bug_reports', 'gameover_choices', 'bonuses', 'link_clicks', 'player_zones']) {
-  defineView('v_' + t,
-    'SELECT x.* FROM ' + t + ' x WHERE ' + TRACKED + ' IS NULL OR x.version = ' + TRACKED);
+for (const t of ['sessions', 'deaths', 'endings', 'survey_answers', 'bug_reports', 'gameover_choices', 'bonuses', 'link_clicks', 'player_zones', 'milestones', 'captures']) {
+  defineView('v_' + t, 'SELECT x.* FROM ' + t + ' x WHERE ' + versionMatch('x.version'));
 }
 
 // les events n'ont pas de version : elle est portee par leur session
 defineView('v_events',
   'SELECT e.* FROM events e WHERE ' + TRACKED + ' IS NULL OR e.session_id IN ' +
-  '(SELECT id FROM sessions WHERE version = ' + TRACKED + ')');
+  '(SELECT s.id FROM sessions s WHERE ' + versionMatch('s.version') + ')');
 
 function trackedVersion() {
   const row = getMeta.get('tracked_version');
@@ -359,6 +400,17 @@ const insertLinkClick = db.prepare(`
 `);
 
 const incrementClickCount = db.prepare(`UPDATE announcements SET click_count = click_count + 1 WHERE id = ?`);
+
+const insertMilestone = db.prepare(`
+  INSERT OR IGNORE INTO milestones (player_id, milestone, version, first_ts) VALUES (?, ?, ?, ?)
+`);
+const insertCaptures = db.prepare(`
+  INSERT OR IGNORE INTO captures (player_id, game, count, version, ts) VALUES (?, ?, ?, ?, ?)
+`);
+
+// paliers, dans l'ordre de l'histoire : tout autre identifiant est ignore
+const MILESTONES = ['contrat_oneira', 'fin_jeu1', 'debut_jeu2', 'fin_jeu2', 'contrat_saphia', 'debut_jeu3'];
+const MILESTONE_SET = new Set(MILESTONES);
 
 // liens que le jeu sait ouvrir : tout le reste est ignore plutot que stocke
 const LINK_TARGETS = new Set(['discord', 'patreon', 'itch', 'announcement', 'changelog']);
@@ -571,6 +623,22 @@ app.post('/v1/event', eventLimiter, (req, res) => {
             version: lvrow ? lvrow.version : null
           });
           if (annId !== null) incrementClickCount.run(annId);
+        }
+      } else if (type === 'milestone' || type === 'milestone_sync') {
+        /* `milestone` : atteint a l'instant. `milestone_sync` : deja atteints
+           dans la save qu'on vient de charger. La cle unique absorbe les redites. */
+        const mvrow = getSessionVersion.get(sid);
+        const version = (mvrow && mvrow.version) || 'unknown';
+        const list = type === 'milestone' ? [e.milestone] : (Array.isArray(e.milestones) ? e.milestones.slice(0, 20) : []);
+        for (const m of list) {
+          const id = txt(m, 32);
+          if (id && MILESTONE_SET.has(id)) insertMilestone.run(pid, id, version, ts);
+        }
+      } else if (type === 'captures') {
+        const game = num(e.game), count = num(e.count);
+        if (game !== null && game >= 1 && game <= 9 && count !== null && count >= 0 && count <= 100000) {
+          const cvrow = getSessionVersion.get(sid);
+          insertCaptures.run(pid, game, count, (cvrow && cvrow.version) || 'unknown', ts);
         }
       }
 
@@ -1143,7 +1211,9 @@ const STAT_TABLES = [
   'survey_answers',
   'bonuses',
   'link_clicks',
-  'player_zones'
+  'player_zones',
+  'milestones',
+  'captures'
 ];
 
 // Archive complete des mesures, a prendre AVANT un reset : une fois les tables
@@ -1444,7 +1514,11 @@ const cmpVer = (a, b) => String(a).localeCompare(String(b), undefined, { numeric
    clause est vide. Numerateur et denominateur passent par la meme, sans quoi un
    pourcentage pourrait depasser 100 %. */
 function sinceClause(minVersion, col) {
-  if (trackedVersion()) return { sql: '1=1', params: [] };
+  /* Une version precise : les vues ont deja tout filtre. Une edition (demo /
+     full) regroupe plusieurs versions, dont certaines peuvent preceder le suivi :
+     on applique donc la borne comme en vue toutes versions. */
+  const tv = trackedVersion();
+  if (tv && !EDITIONS.has(tv)) return { sql: '1=1', params: [] };
   const versions = db.prepare(`SELECT DISTINCT version FROM sessions WHERE version IS NOT NULL`).all()
     .map((r) => r.version).filter((v) => cmpVer(v, minVersion) >= 0);
   if (!versions.length) return { sql: '0=1', params: [] };
@@ -1453,7 +1527,7 @@ function sinceClause(minVersion, col) {
 
 function playersSince(minVersion) {
   const tv = trackedVersion();
-  if (tv && cmpVer(tv, minVersion) < 0) return 0;
+  if (tv && !EDITIONS.has(tv) && cmpVer(tv, minVersion) < 0) return 0;
   const c = sinceClause(minVersion);
   return db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions WHERE ` + c.sql).get(...c.params).n;
 }
@@ -1461,6 +1535,8 @@ function playersSince(minVersion) {
 // la version suivie est-elle anterieure au suivi ? (null = toutes versions)
 function trackedBefore(minVersion) {
   const tv = trackedVersion();
+  if (tv === 'demo') return editionOf(minVersion) !== 'demo';   // la demo n'a jamais eu ce suivi
+  if (tv === 'full') return false;
   return !!tv && cmpVer(tv, minVersion) < 0;
 }
 
@@ -1618,6 +1694,46 @@ app.get('/v1/stats/progression', adminLimiter, requireAdmin, (req, res) => {
   for (const r of rows) byZone[r.zone] = r.players;
   const base = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_sessions WHERE player_id IN ${NEW_PLAYERS}`).get(since).n;
   res.json({ byZone, base, since });
+});
+
+/* Suivis apparus en 0.5.5 : paliers de l'histoire et captures par jeu termine. */
+const TRACKED_SINCE_055 = '0.5.5';
+
+/* Paliers : part des joueurs entres en jeu (au moins une zone atteinte) qui ont
+   franchi chaque palier. Numerateur et denominateur sur les memes versions, sans
+   quoi un pourcentage pourrait depasser 100 %. */
+app.get('/v1/stats/milestones', adminLimiter, requireAdmin, (req, res) => {
+  const c = sinceClause(TRACKED_SINCE_055);
+  const rows = db.prepare(`
+    SELECT milestone, COUNT(DISTINCT player_id) AS players
+    FROM v_milestones WHERE ` + c.sql + ` GROUP BY milestone
+  `).all(...c.params);
+  const byMilestone = {};
+  for (const r of rows) byMilestone[r.milestone] = r.players;
+  const base = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM v_player_zones WHERE ` + c.sql).get(...c.params).n;
+  res.json({ order: MILESTONES, byMilestone, base,
+    trackedSince: TRACKED_SINCE_055, notTracked: trackedBefore(TRACKED_SINCE_055) });
+});
+
+/* Captures : nombre de fois ou le joueur s'est fait attraper pendant un jeu,
+   releve au moment ou il le termine. Moyenne, mediane et repartition par jeu. */
+const CAPTURE_BUCKETS = [[0, 0, '0'], [1, 2, '1-2'], [3, 5, '3-5'], [6, 10, '6-10'], [11, 20, '11-20'], [21, Infinity, '21+']];
+app.get('/v1/stats/captures', adminLimiter, requireAdmin, (req, res) => {
+  const c = sinceClause(TRACKED_SINCE_055);
+  const all = db.prepare(`SELECT game, count FROM v_captures WHERE ` + c.sql + ` ORDER BY game, count`).all(...c.params);
+  const byGame = {};
+  for (const r of all) (byGame[r.game] = byGame[r.game] || []).push(r.count);
+  const games = Object.keys(byGame).map(Number).sort((a, b) => a - b).map((g) => {
+    const v = byGame[g], n = v.length;
+    const median = n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+    return {
+      game: g, players: n,
+      avg: Math.round(v.reduce((a, x) => a + x, 0) / n * 10) / 10,
+      median, min: v[0], max: v[n - 1],
+      buckets: CAPTURE_BUCKETS.map(([lo, hi, label]) => ({ label, players: v.filter((x) => x >= lo && x <= hi).length }))
+    };
+  });
+  res.json({ games, trackedSince: TRACKED_SINCE_055, notTracked: trackedBefore(TRACKED_SINCE_055) });
 });
 
 // Diagnostic: distribution of finished-session durations across buckets.
