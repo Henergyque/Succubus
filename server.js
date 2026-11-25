@@ -245,6 +245,7 @@ CREATE INDEX IF NOT EXISTS idx_link_clicks_ann ON link_clicks(announcement_id);
 CREATE INDEX IF NOT EXISTS idx_bug_reports_ts ON bug_reports(ts);
 CREATE INDEX IF NOT EXISTS idx_announcements_created ON announcements(created_at);
 CREATE INDEX IF NOT EXISTS idx_deaths_map ON deaths(map_id);
+CREATE INDEX IF NOT EXISTS idx_deaths_cell ON deaths(map_id, x, y, enemy);
 CREATE INDEX IF NOT EXISTS idx_deaths_enemy ON deaths(enemy);
 CREATE INDEX IF NOT EXISTS idx_deaths_ts ON deaths(ts);
 CREATE INDEX IF NOT EXISTS idx_endings_ending ON endings(ending);
@@ -1439,14 +1440,24 @@ app.get('/v1/stats/deaths', adminLimiter, requireAdmin, (req, res) => {
   /* Les croix de la carte. Agrege cote SQL : le dashboard recoit une position
      unique par case avec son poids, pas les dizaines de milliers de morts brutes.
      L'ennemi retenu est celui qui tue le plus souvent a cet endroit precis. */
+  /* Une seule passe : comptes par (case, ennemi), puis le premier ennemi non
+     nul de chaque case. L'ancienne version relancait une sous-requete sur toute
+     la table pour CHAQUE case : cout en cases x captures, plusieurs secondes de
+     serveur bloque des que la table grossit (et autant par bascule de version). */
   const points = db.prepare(`
-    SELECT map_id, x, y, COUNT(*) AS count,
-           (SELECT d2.enemy FROM v_deaths d2
-             WHERE d2.map_id = d.map_id AND d2.x = d.x AND d2.y = d.y AND d2.enemy IS NOT NULL
-             GROUP BY d2.enemy ORDER BY COUNT(*) DESC LIMIT 1) AS enemy
-    FROM v_deaths d
-    WHERE x IS NOT NULL AND y IS NOT NULL AND (@map_id IS NULL OR map_id = @map_id)
-    GROUP BY map_id, x, y
+    WITH cells AS (
+      SELECT map_id, x, y, enemy, COUNT(*) AS c
+      FROM v_deaths
+      WHERE x IS NOT NULL AND y IS NOT NULL AND (@map_id IS NULL OR map_id = @map_id)
+      GROUP BY map_id, x, y, enemy
+    ), ranked AS (
+      SELECT map_id, x, y, enemy,
+             SUM(c) OVER (PARTITION BY map_id, x, y) AS total,
+             ROW_NUMBER() OVER (PARTITION BY map_id, x, y ORDER BY (enemy IS NULL), c DESC, enemy) AS rn
+      FROM cells
+    )
+    SELECT map_id, x, y, total AS count, enemy
+    FROM ranked WHERE rn = 1
     ORDER BY count DESC
     LIMIT 5000
   `).all({ map_id: mapId });
